@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>UAR — Revue des Accès Utilisateurs</title>
+  <!-- CDN : connexion internet requise au premier chargement -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+</head>
+<body style="margin:0">
+  <div id="root"></div>
+
+  <script type="text/babel" data-presets="react">
+    const { useState, useMemo, useRef } = React;
+    const XLSX_LIB = window.XLSX;
+
+    /* ─ utils ─ */
+    const nk = (u, a, p) =>
+      [u, a, p].map(s => String(s ?? "").toLowerCase().trim()).join("|||");
+
+    function parseExcel(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = e => {
+          try {
+            const data = new Uint8Array(e.target.result);
+            const wb = XLSX_LIB.read(data, { type: "array" });
+            const ws = wb.Sheets[wb.SheetNames[0]];
+            const rows = XLSX_LIB.utils.sheet_to_json(ws, { defval: "" });
+            const headers = rows.length ? Object.keys(rows[0]) : [];
+            resolve({ rows, headers });
+          } catch (err) { reject(err); }
+        };
+        reader.onerror = reject;
+        reader.readAsArrayBuffer(file);
+      });
+    }
+
+    const COL_HINTS = {
+      utilisateur: ["utilisateur","user","login","identifiant","matricule","compte","account"],
+      application: ["application","app","système","systeme","service","outil","tool"],
+      profil:      ["profil","rôle","role","droit","permission","groupe","habilitation","access"],
+    };
+    function autoDetect(headers, type) {
+      for (const h of headers)
+        if (COL_HINTS[type].some(k => h.toLowerCase().includes(k))) return h;
+      return headers[0] ?? "";
+    }
+    function suggestMapping(headers) {
+      return {
+        utilisateur: autoDetect(headers, "utilisateur"),
+        application: autoDetect(headers, "application"),
+        profil:      autoDetect(headers, "profil"),
+      };
+    }
+    function computeEcarts(rows1, rows2, m1, m2) {
+      const covered = new Set(
+        rows2.map(r => nk(r[m2.utilisateur], r[m2.application], r[m2.profil]))
+      );
+      return rows1
+        .filter(r => !covered.has(nk(r[m1.utilisateur], r[m1.application], r[m1.profil])))
+        .map(r => ({
+          utilisateur: String(r[m1.utilisateur] ?? ""),
+          application: String(r[m1.application] ?? ""),
+          profil: String(r[m1.profil] ?? ""),
+        }));
+    }
+    function makeEmail(appName, list, resp) {
+      const n = list.length;
+      const rows = list.map((e, i) => `  ${i + 1}. ${e.utilisateur} — Profil : ${e.profil}`).join("\n");
+      return `Objet : [UAR] Revue des accès – ${appName} – ${n} écart(s) détecté(s)
+
+Bonjour ${resp.nom || "[Responsable]"},
+
+Dans le cadre de la revue périodique des accès utilisateurs (UAR), une comparaison entre les droits effectivement provisionnés dans ${appName} et les habilitations enregistrées dans notre outil de ticketing a mis en évidence ${n} accès non couvert(s) par un ticket justificatif.
+
+▌ Accès concernés :
+
+${rows}
+
+Ces droits ne disposent d'aucune demande formelle tracée, ce qui constitue un écart au regard de notre politique de gestion des habilitations.
+
+Nous vous remercions de bien vouloir, pour chacun des accès listés :
+
+  1. Confirmer la légitimité du droit et soumettre, si nécessaire, un ticket de régularisation ;
+  2. Ou initier la suppression de l'accès dans les meilleurs délais.
+
+Merci de nous faire un retour avant le [DATE LIMITE] afin de clôturer cette revue dans les délais convenus.
+
+Nous restons disponibles pour tout échange complémentaire.
+
+Bien cordialement,
+[Votre nom / Votre signature]`;
+    }
+
+    /* ─ micro-components ─ */
+    function Badge({ children, color = "amber" }) {
+      const c = {
+        amber: { bg:"#2d1a00", text:"#fbbf24", border:"#78350f" },
+        green: { bg:"#052e16", text:"#4ade80", border:"#166534" },
+        red:   { bg:"#450a0a", text:"#f87171", border:"#991b1b" },
+        blue:  { bg:"#0c1a2e", text:"#60a5fa", border:"#1e40af" },
+        gray:  { bg:"#1c1c1c", text:"#9ca3af", border:"#374151" },
+      }[color];
+      return (
+        <span style={{
+          background:c.bg, color:c.text, border:`1px solid ${c.border}`,
+          borderRadius:4, padding:"2px 8px", fontSize:11, fontWeight:600,
+          fontFamily:"monospace", letterSpacing:"0.04em", whiteSpace:"nowrap",
+        }}>{children}</span>
+      );
+    }
+
+    function StatCard({ label, value, sub, color }) {
+      return (
+        <div style={{ background:"#161b22", border:"1px solid #30363d", borderRadius:10, padding:"18px 22px", flex:"1 1 140px" }}>
+          <div style={{ fontSize:32, fontWeight:700, color, fontFamily:"monospace", lineHeight:1 }}>{value}</div>
+          <div style={{ fontSize:12, color:"#8b949e", marginTop:6, fontWeight:500 }}>{label}</div>
+          {sub && <div style={{ fontSize:11, color:"#6e7681", marginTop:3 }}>{sub}</div>}
+        </div>
+      );
+    }
+
+    function DropZone({ label, onFile, fileName }) {
+      const ref = useRef();
+      const [drag, setDrag] = useState(false);
+      const handle = f => f && onFile(f);
+      return (
+        <div
+          onClick={() => ref.current.click()}
+          onDragOver={e => { e.preventDefault(); setDrag(true); }}
+          onDragLeave={() => setDrag(false)}
+          onDrop={e => { e.preventDefault(); setDrag(false); handle(e.dataTransfer.files[0]); }}
+          style={{
+            border:`2px dashed ${drag?"#f59e0b":fileName?"#3fb950":"#30363d"}`,
+            borderRadius:8, padding:"22px 16px", textAlign:"center", cursor:"pointer",
+            background:drag?"#1a1500":"#0d1117", transition:"all 0.18s", userSelect:"none",
+          }}
+        >
+          <input ref={ref} type="file" accept=".xlsx,.xls,.csv" style={{ display:"none" }}
+            onChange={e => handle(e.target.files[0])} />
+          <div style={{ fontSize:26, marginBottom:8 }}>{fileName?"✅":"📂"}</div>
+          <div style={{ color:fileName?"#3fb950":"#8b949e", fontSize:12, fontWeight:500 }}>
+            {fileName ? fileName : label}
+          </div>
+          {fileName && <div style={{ color:"#4b5563", fontSize:11, marginTop:3 }}>Cliquer pour remplacer</div>}
+        </div>
+      );
+    }
+
+    function ColMapper({ headers, mapping, onChange, label }) {
+      const fields = [
+        { key:"utilisateur", label:"Utilisateur / Login", icon:"👤" },
+        { key:"application", label:"Application / Système", icon:"🖥️" },
+        { key:"profil",      label:"Profil / Rôle",        icon:"🔑" },
+      ];
+      const sel = {
+        background:"#0d1117", border:"1px solid #30363d", color:"#e6edf3",
+        borderRadius:5, padding:"5px 8px", fontSize:12, flex:1, outline:"none", fontFamily:"monospace",
+      };
+      return (
+        <div style={{ background:"#161b22", border:"1px solid #30363d", borderRadius:8, padding:"14px 16px" }}>
+          <div style={{ fontSize:10, color:"#6e7681", marginBottom:12, textTransform:"uppercase", letterSpacing:"0.1em" }}>{label}</div>
+          <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+            {fields.map(f => (
+              <div key={f.key} style={{ display:"flex", alignItems:"center", gap:10 }}>
+                <span style={{ fontSize:14, width:22, textAlign:"center" }}>{f.icon}</span>
+                <span style={{ fontSize:11, color:"#8b949e", width:155, flexShrink:0 }}>{f.label}</span>
+                <select value={mapping[f.key]} onChange={e => onChange({...mapping,[f.key]:e.target.value})} style={sel}>
+                  {headers.map(h => <option key={h} value={h}>{h}</option>)}
+                </select>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    /* ─ App ─ */
+    function App() {
+      const [tab, setTab] = useState("import");
+      const [file1, setFile1] = useState(null);
+      const [file2, setFile2] = useState(null);
+      const [map1, setMap1] = useState({ utilisateur:"", application:"", profil:"" });
+      const [map2, setMap2] = useState({ utilisateur:"", application:"", profil:"" });
+      const [responsables, setResponsables] = useState({});
+      const [search, setSearch] = useState("");
+      const [filterApp, setFilterApp] = useState("all");
+      const [copiedId, setCopiedId] = useState(null);
+      const sessionRef = useRef();
+
+      const handleFile = async (raw, which) => {
+        try {
+          const parsed = await parseExcel(raw);
+          const mapping = suggestMapping(parsed.headers);
+          if (which === 1) { setFile1({...parsed, name:raw.name}); setMap1(mapping); }
+          else             { setFile2({...parsed, name:raw.name}); setMap2(mapping); }
+        } catch (e) { alert("Erreur de lecture : " + e.message); }
+      };
+
+      const ecarts = useMemo(() => {
+        if (!file1||!file2||!map1.utilisateur||!map2.utilisateur) return [];
+        return computeEcarts(file1.rows, file2.rows, map1, map2);
+      }, [file1, file2, map1, map2]);
+
+      const apps = useMemo(() => [...new Set(ecarts.map(e => e.application))].sort(), [ecarts]);
+
+      const filtered = useMemo(() => {
+        let res = ecarts;
+        if (filterApp !== "all") res = res.filter(e => e.application === filterApp);
+        if (search) {
+          const q = search.toLowerCase();
+          res = res.filter(e =>
+            e.utilisateur.toLowerCase().includes(q) ||
+            e.application.toLowerCase().includes(q) ||
+            e.profil.toLowerCase().includes(q)
+          );
+        }
+        return res;
+      }, [ecarts, filterApp, search]);
+
+      const updateResp = (app, field, val) =>
+        setResponsables(p => ({...p, [app]:{...(p[app]||{}), [field]:val}}));
+
+      const exportSession = () => {
+        const s = {
+          exportedAt: new Date().toISOString(),
+          file1: file1 ? {name:file1.name, rows:file1.rows, headers:file1.headers} : null,
+          file2: file2 ? {name:file2.name, rows:file2.rows, headers:file2.headers} : null,
+          map1, map2, responsables, ecarts,
+        };
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(new Blob([JSON.stringify(s,null,2)], {type:"application/json"}));
+        a.download = `uar_session_${new Date().toISOString().slice(0,10)}.json`;
+        a.click();
+      };
+
+      const importSession = file => {
+        const r = new FileReader();
+        r.onload = e => {
+          try {
+            const s = JSON.parse(e.target.result);
+            if (s.file1) setFile1(s.file1);
+            if (s.file2) setFile2(s.file2);
+            if (s.map1) setMap1(s.map1);
+            if (s.map2) setMap2(s.map2);
+            if (s.responsables) setResponsables(s.responsables);
+            setTab("analyse");
+          } catch { alert("Fichier JSON invalide"); }
+        };
+        r.readAsText(file);
+      };
+
+      const exportCSV = () => {
+        const csv = "Utilisateur,Application,Profil\n" +
+          ecarts.map(e => `"${e.utilisateur}","${e.application}","${e.profil}"`).join("\n");
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(new Blob([csv], {type:"text/csv;charset=utf-8"}));
+        a.download = `ecarts_uar_${new Date().toISOString().slice(0,10)}.csv`;
+        a.click();
+      };
+
+      const copy = (id, text) => {
+        navigator.clipboard.writeText(text).catch(() => {
+          const ta = document.createElement("textarea");
+          ta.value = text; document.body.appendChild(ta);
+          ta.select(); document.execCommand("copy"); document.body.removeChild(ta);
+        });
+        setCopiedId(id);
+        setTimeout(() => setCopiedId(null), 2200);
+      };
+
+      const ready = !!(file1 && file2 && map1.utilisateur && map2.utilisateur);
+
+      const btn = (color="#f59e0b", bg="transparent") => ({
+        background:bg, border:`1px solid ${color}`, color,
+        borderRadius:6, padding:"7px 14px", fontSize:12, cursor:"pointer",
+        fontWeight:500, fontFamily:"sans-serif",
+      });
+      const input = {
+        background:"#161b22", border:"1px solid #30363d", color:"#e6edf3",
+        borderRadius:6, padding:"8px 12px", fontSize:13, outline:"none", fontFamily:"sans-serif",
+      };
+
+      const TABS = [
+        { id:"import",       label:"① Import",       dot:ready },
+        { id:"analyse",      label:"② Analyse",       dot:ecarts.length>0, off:!ready },
+        { id:"responsables", label:"③ Responsables",  dot:apps.some(a=>responsables[a]?.nom), off:!ready },
+        { id:"mails",        label:"④ Mails",         dot:false, off:!ready },
+      ];
+
+      /* ── IMPORT ── */
+      const TabImport = () => (
+        <div>
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:20 }}>
+            <div>
+              <div style={{ marginBottom:10, fontSize:11, color:"#8b949e", textTransform:"uppercase", letterSpacing:"0.1em" }}>
+                Fichier 1 — Droits réels applicatifs
+              </div>
+              <DropZone label="Déposer ou cliquer · .xlsx / .xls / .csv" onFile={f=>handleFile(f,1)} fileName={file1?.name} />
+              {file1 && (
+                <div style={{ marginTop:12 }}>
+                  <ColMapper headers={file1.headers} mapping={map1} onChange={setMap1} label="Mapping colonnes — Fichier 1" />
+                  <div style={{ fontSize:11, color:"#6e7681", marginTop:6 }}>{file1.rows.length.toLocaleString("fr-FR")} lignes chargées</div>
+                </div>
+              )}
+            </div>
+            <div>
+              <div style={{ marginBottom:10, fontSize:11, color:"#8b949e", textTransform:"uppercase", letterSpacing:"0.1em" }}>
+                Fichier 2 — Habilitations autorisées (ticketing)
+              </div>
+              <DropZone label="Déposer ou cliquer · .xlsx / .xls / .csv" onFile={f=>handleFile(f,2)} fileName={file2?.name} />
+              {file2 && (
+                <div style={{ marginTop:12 }}>
+                  <ColMapper headers={file2.headers} mapping={map2} onChange={setMap2} label="Mapping colonnes — Fichier 2" />
+                  <div style={{ fontSize:11, color:"#6e7681", marginTop:6 }}>{file2.rows.length.toLocaleString("fr-FR")} lignes chargées</div>
+                </div>
+              )}
+            </div>
+          </div>
+          {ready && (
+            <div style={{ marginTop:20, padding:"14px 18px", background:"#042012", border:"1px solid #166534", borderRadius:8, display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+              <span style={{ color:"#4ade80", fontSize:13 }}>✓ Fichiers chargés — prêt pour l'analyse</span>
+              <button style={btn("#4ade80","#052e16")} onClick={() => setTab("analyse")}>Analyser les écarts →</button>
+            </div>
+          )}
+        </div>
+      );
+
+      /* ── ANALYSE ── */
+      const TabAnalyse = () => {
+        const total = file1?.rows.length ?? 0;
+        const covered = total - ecarts.length;
+        const pct = total > 0 ? Math.round((ecarts.length/total)*100) : 0;
+        const rc = pct>20?"#f85149":pct>5?"#f59e0b":"#3fb950";
+        return (
+          <div>
+            <div style={{ display:"flex", gap:14, marginBottom:24, flexWrap:"wrap" }}>
+              <StatCard label="Droits réels totaux" value={total.toLocaleString("fr-FR")} color="#58a6ff" />
+              <StatCard label="Droits couverts" value={covered.toLocaleString("fr-FR")} color="#3fb950" sub="avec ticket associé" />
+              <StatCard label="Écarts détectés" value={ecarts.length.toLocaleString("fr-FR")} color="#f59e0b" sub="sans justificatif" />
+              <StatCard label="Taux d'écart" value={`${pct}%`} color={rc} sub={pct>20?"⚠ Risque élevé":pct>5?"Attention requise":"Niveau acceptable"} />
+            </div>
+            <div style={{ display:"flex", gap:10, marginBottom:14, flexWrap:"wrap" }}>
+              <input value={search} onChange={e=>setSearch(e.target.value)}
+                placeholder="Rechercher utilisateur, application, profil…"
+                style={{...input, flex:"1 1 240px"}} />
+              <select value={filterApp} onChange={e=>setFilterApp(e.target.value)} style={{...input, minWidth:200}}>
+                <option value="all">Toutes les applications ({ecarts.length})</option>
+                {apps.map(a => <option key={a} value={a}>{a} ({ecarts.filter(e=>e.application===a).length})</option>)}
+              </select>
+              {ecarts.length > 0 && <button style={btn("#8b949e")} onClick={exportCSV}>↓ Export CSV</button>}
+            </div>
+            <div style={{ border:"1px solid #30363d", borderRadius:8, overflow:"hidden" }}>
+              <table style={{ width:"100%", borderCollapse:"collapse" }}>
+                <thead>
+                  <tr style={{ background:"#161b22" }}>
+                    {["#","Utilisateur","Application","Profil / Rôle","Statut"].map(h => (
+                      <th key={h} style={{ padding:"10px 14px", textAlign:"left", fontSize:10, fontWeight:600, color:"#8b949e", textTransform:"uppercase", letterSpacing:"0.1em", borderBottom:"1px solid #30363d" }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {filtered.length === 0 ? (
+                    <tr><td colSpan={5} style={{ padding:36, textAlign:"center", color:"#8b949e" }}>
+                      {ecarts.length===0?"🎉 Aucun écart détecté":"Aucun résultat pour ce filtre"}
+                    </td></tr>
+                  ) : filtered.map((e,i) => (
+                    <tr key={i} style={{ borderBottom:"1px solid #21262d", background:i%2===0?"transparent":"#0a0e14" }}>
+                      <td style={{ padding:"9px 14px", color:"#4b5563", fontSize:11, fontFamily:"monospace" }}>{i+1}</td>
+                      <td style={{ padding:"9px 14px", fontFamily:"monospace", fontSize:12 }}>{e.utilisateur}</td>
+                      <td style={{ padding:"9px 14px" }}><Badge color="blue">{e.application}</Badge></td>
+                      <td style={{ padding:"9px 14px", fontFamily:"monospace", fontSize:12 }}>{e.profil}</td>
+                      <td style={{ padding:"9px 14px" }}><Badge color="amber">Sans ticket</Badge></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {filtered.length > 0 && filtered.length < ecarts.length && (
+              <div style={{ textAlign:"right", fontSize:11, color:"#6e7681", marginTop:8 }}>{filtered.length} / {ecarts.length} écarts affichés</div>
+            )}
+            {ecarts.length > 0 && (
+              <div style={{ marginTop:18, display:"flex", justifyContent:"flex-end" }}>
+                <button style={btn("#f59e0b","#1c1407")} onClick={()=>setTab("responsables")}>Configurer les responsables →</button>
+              </div>
+            )}
+          </div>
+        );
+      };
+
+      /* ── RESPONSABLES ── */
+      const TabResponsables = () => (
+        <div>
+          <p style={{ color:"#8b949e", marginBottom:20, lineHeight:1.7, fontSize:13 }}>
+            Renseignez le nom et l'e-mail du responsable à contacter pour chaque application en écart.
+          </p>
+          {apps.length === 0 ? (
+            <div style={{ textAlign:"center", color:"#8b949e", padding:40 }}>Aucun écart détecté</div>
+          ) : (
+            <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+              {apps.map(app => {
+                const r = responsables[app] || {};
+                const count = ecarts.filter(e=>e.application===app).length;
+                const done = !!(r.nom && r.email);
+                return (
+                  <div key={app} style={{
+                    background:"#161b22", border:`1px solid ${done?"#166534":"#30363d"}`,
+                    borderRadius:8, padding:"14px 18px", display:"flex", alignItems:"center", gap:14, flexWrap:"wrap",
+                  }}>
+                    <div style={{ flex:"0 0 210px" }}>
+                      <div style={{ fontFamily:"monospace", fontWeight:600, color:"#60a5fa", fontSize:13 }}>{app}</div>
+                      <div style={{ marginTop:5 }}><Badge color="amber">{count} écart{count>1?"s":""}</Badge></div>
+                    </div>
+                    <input value={r.nom||""} onChange={e=>updateResp(app,"nom",e.target.value)}
+                      placeholder="Nom du responsable" style={{...input, flex:"1 1 160px"}} />
+                    <input value={r.email||""} onChange={e=>updateResp(app,"email",e.target.value)}
+                      placeholder="email@entreprise.com" type="email" style={{...input, flex:"1 1 200px"}} />
+                    <span style={{ fontSize:18, width:24, textAlign:"center" }}>{done?"✅":"○"}</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          <div style={{ marginTop:20, display:"flex", justifyContent:"flex-end" }}>
+            <button style={btn("#f59e0b","#1c1407")} onClick={()=>setTab("mails")}>Générer les mails →</button>
+          </div>
+        </div>
+      );
+
+      /* ── MAILS ── */
+      const TabMails = () => (
+        <div>
+          {apps.length === 0 ? (
+            <div style={{ textAlign:"center", color:"#8b949e", padding:40 }}>🎉 Aucun écart — rien à envoyer</div>
+          ) : (
+            <>
+              <p style={{ color:"#8b949e", marginBottom:20, lineHeight:1.7, fontSize:13 }}>
+                Remplacez <strong style={{color:"#f59e0b"}}>[DATE LIMITE]</strong> et votre signature avant envoi.
+              </p>
+              <div style={{ display:"flex", flexDirection:"column", gap:18 }}>
+                {apps.map(app => {
+                  const appEcarts = ecarts.filter(e=>e.application===app);
+                  const resp = responsables[app]||{};
+                  const mailText = makeEmail(app, appEcarts, resp);
+                  const id = `mail_${app}`;
+                  const copied = copiedId===id;
+                  return (
+                    <div key={app} style={{ border:"1px solid #30363d", borderRadius:8, overflow:"hidden" }}>
+                      <div style={{
+                        padding:"12px 18px", background:"#0f131a", borderBottom:"1px solid #30363d",
+                        display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:10,
+                      }}>
+                        <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+                          <span style={{ fontWeight:600, color:"#60a5fa", fontFamily:"monospace" }}>{app}</span>
+                          <Badge color="amber">{appEcarts.length} écart{appEcarts.length>1?"s":""}</Badge>
+                          {resp.email
+                            ? <span style={{ color:"#8b949e", fontSize:12 }}>→ {resp.email}</span>
+                            : <Badge color="gray">Email non renseigné</Badge>
+                          }
+                        </div>
+                        <div style={{ display:"flex", gap:8 }}>
+                          {resp.email && (
+                            <a href={`mailto:${resp.email}?subject=${encodeURIComponent(`[UAR] Revue des accès – ${app}`)}&body=${encodeURIComponent(mailText)}`}
+                               style={{...btn("#8b949e"), textDecoration:"none", display:"inline-block"}}>
+                              ✉ Ouvrir dans Mail
+                            </a>
+                          )}
+                          <button onClick={()=>copy(id,mailText)}
+                            style={btn(copied?"#4ade80":"#f59e0b", copied?"#052e16":"#1c1407")}>
+                            {copied?"✓ Copié !":"⧉ Copier"}
+                          </button>
+                        </div>
+                      </div>
+                      <pre style={{
+                        margin:0, padding:"16px 20px", fontSize:12, lineHeight:1.75,
+                        color:"#c9d1d9", fontFamily:"monospace", whiteSpace:"pre-wrap",
+                        wordBreak:"break-word", maxHeight:340, overflowY:"auto", background:"#0d1117",
+                      }}>
+                        {mailText}
+                      </pre>
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          )}
+        </div>
+      );
+
+      return (
+        <div style={{ background:"#0d1117", minHeight:"100vh", color:"#e6edf3", fontFamily:"system-ui, sans-serif", fontSize:14 }}>
+          {/* Header */}
+          <div style={{ background:"#161b22", borderBottom:"1px solid #30363d", padding:"14px 24px", display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:10 }}>
+            <div>
+              <div style={{ fontWeight:700, fontSize:16, letterSpacing:"-0.02em" }}>🛡 UAR — Revue des Accès Utilisateurs</div>
+              <div style={{ color:"#6e7681", fontSize:11, marginTop:3 }}>User Access Review · Détection des écarts d'habilitations</div>
+            </div>
+            <div style={{ display:"flex", gap:8 }}>
+              <input ref={sessionRef} type="file" accept=".json" style={{ display:"none" }}
+                onChange={e=>{importSession(e.target.files[0]); e.target.value="";}} />
+              <button style={btn("#8b949e")} onClick={()=>sessionRef.current.click()}>↑ Charger session</button>
+              <button style={btn("#f59e0b","#1c1407")} onClick={exportSession}>↓ Sauvegarder session</button>
+            </div>
+          </div>
+
+          {/* Tabs */}
+          <div style={{ display:"flex", background:"#0d1117", borderBottom:"1px solid #21262d", padding:"0 20px" }}>
+            {TABS.map(t => (
+              <button key={t.id} onClick={()=>!t.off&&setTab(t.id)} style={{
+                padding:"12px 18px", border:"none", background:"transparent",
+                borderBottom:tab===t.id?"2px solid #f59e0b":"2px solid transparent",
+                color:tab===t.id?"#f59e0b":t.off?"#4b5563":"#8b949e",
+                cursor:t.off?"not-allowed":"pointer", fontSize:13, fontWeight:500,
+                display:"flex", alignItems:"center", gap:6, fontFamily:"system-ui, sans-serif",
+              }}>
+                {t.label}
+                {t.dot && <span style={{ width:6, height:6, borderRadius:"50%", background:"#3fb950", display:"inline-block" }} />}
+              </button>
+            ))}
+          </div>
+
+          {/* Content */}
+          <div style={{ padding:"28px 24px", maxWidth:1080, margin:"0 auto" }}>
+            {tab==="import"       && <TabImport />}
+            {tab==="analyse"      && <TabAnalyse />}
+            {tab==="responsables" && <TabResponsables />}
+            {tab==="mails"        && <TabMails />}
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
