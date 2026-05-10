@@ -1,540 +1,891 @@
 <!DOCTYPE html>
+
 <html lang="fr">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>UAR — Revue des Accès Utilisateurs</title>
-  <!-- CDN : connexion internet requise au premier chargement -->
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>UAR — Revue des Accès v2</title>
   <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 </head>
 <body style="margin:0">
-  <div id="root"></div>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useMemo, useRef } = React;
+const XL = window.XLSX;
 
-  <script type="text/babel" data-presets="react">
-    const { useState, useMemo, useRef } = React;
-    const XLSX_LIB = window.XLSX;
+// ══════════════════════════════════════════════════════════════
+// CONSTANTS
+// ══════════════════════════════════════════════════════════════
 
-    /* ─ utils ─ */
-    const nk = (u, a, p) =>
-      [u, a, p].map(s => String(s ?? "").toLowerCase().trim()).join("|||");
+const ACCOUNT_TYPES = [
+{ id:‘admin_pam’,   label:‘Admins / PAM’,                 frequence:‘Mensuelle’,     days:30  },
+{ id:‘admin_app’,   label:‘Admins applicatifs’,            frequence:‘Trimestrielle’, days:90  },
+{ id:‘service’,     label:‘Comptes de service’,            frequence:‘Semestrielle’,  days:180 },
+{ id:‘prestataire’, label:‘Prestataires / accès externes’, frequence:‘Trimestrielle’, days:90  },
+{ id:‘standard’,    label:‘Utilisateurs standard’,         frequence:‘Annuelle’,      days:365 },
+{ id:‘dormant’,     label:‘Comptes dormants (>90j)’,       frequence:‘Mensuelle’,     days:30  },
+];
 
-    function parseExcel(file) {
-      return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = e => {
-          try {
-            const data = new Uint8Array(e.target.result);
-            const wb = XLSX_LIB.read(data, { type: "array" });
-            const ws = wb.Sheets[wb.SheetNames[0]];
-            const rows = XLSX_LIB.utils.sheet_to_json(ws, { defval: "" });
-            const headers = rows.length ? Object.keys(rows[0]) : [];
-            resolve({ rows, headers });
-          } catch (err) { reject(err); }
-        };
-        reader.onerror = reject;
-        reader.readAsArrayBuffer(file);
-      });
-    }
+const DORMANT_DAYS = 90;
 
-    const COL_HINTS = {
-      utilisateur: ["utilisateur","user","login","identifiant","matricule","compte","account"],
-      application: ["application","app","système","systeme","service","outil","tool"],
-      profil:      ["profil","rôle","role","droit","permission","groupe","habilitation","access"],
-    };
-    function autoDetect(headers, type) {
-      for (const h of headers)
-        if (COL_HINTS[type].some(k => h.toLowerCase().includes(k))) return h;
-      return headers[0] ?? "";
-    }
-    function suggestMapping(headers) {
-      return {
-        utilisateur: autoDetect(headers, "utilisateur"),
-        application: autoDetect(headers, "application"),
-        profil:      autoDetect(headers, "profil"),
-      };
-    }
-    function computeEcarts(rows1, rows2, m1, m2) {
-      const covered = new Set(
-        rows2.map(r => nk(r[m2.utilisateur], r[m2.application], r[m2.profil]))
-      );
-      return rows1
-        .filter(r => !covered.has(nk(r[m1.utilisateur], r[m1.application], r[m1.profil])))
-        .map(r => ({
-          utilisateur: String(r[m1.utilisateur] ?? ""),
-          application: String(r[m1.application] ?? ""),
-          profil: String(r[m1.profil] ?? ""),
-        }));
-    }
-    function makeEmail(appName, list, resp) {
-      const n = list.length;
-      const rows = list.map((e, i) => `  ${i + 1}. ${e.utilisateur} — Profil : ${e.profil}`).join("\n");
-      return `Objet : [UAR] Revue des accès – ${appName} – ${n} écart(s) détecté(s)
+const DEC = { ATTENTE:‘en_attente’, MAINTENIR:‘maintenir’, REVOQUER:‘revoquer’ };
 
-Bonjour ${resp.nom || "[Responsable]"},
+const ITYPE = {
+ecart:    { label:‘Sans ticket’, color:‘amber’ },
+orphelin: { label:‘Orphelin’,    color:‘red’   },
+dormant:  { label:‘Dormant’,     color:‘blue’  },
+};
 
-Dans le cadre de la revue périodique des accès utilisateurs (UAR), une comparaison entre les droits effectivement provisionnés dans ${appName} et les habilitations enregistrées dans notre outil de ticketing a mis en évidence ${n} accès non couvert(s) par un ticket justificatif.
+// ══════════════════════════════════════════════════════════════
+// UTILITIES
+// ══════════════════════════════════════════════════════════════
+
+const nk = (u,a,p) => [u,a,p].map(s=>String(s??””).toLowerCase().trim()).join(”|||”);
+const ik = i => `${i.type}|||${nk(i.utilisateur, i.application||'', i.profil||'')}`;
+
+function parseExcel(file) {
+return new Promise((res,rej) => {
+const r = new FileReader();
+r.onload = e => {
+try {
+const wb = XL.read(new Uint8Array(e.target.result),{type:“array”});
+const ws = wb.Sheets[wb.SheetNames[0]];
+const rows = XL.utils.sheet_to_json(ws,{defval:””});
+res({ rows, headers: rows.length?Object.keys(rows[0]):[], name:file.name });
+} catch(err){rej(err);}
+};
+r.onerror = rej;
+r.readAsArrayBuffer(file);
+});
+}
+
+const HINTS = {
+utilisateur:       [“utilisateur”,“user”,“login”,“identifiant”,“matricule”,“compte”,“account”,“samaccountname”],
+application:       [“application”,“app”,“système”,“systeme”,“service”,“outil”,“tool”],
+profil:            [“profil”,“rôle”,“role”,“droit”,“permission”,“groupe”,“habilitation”,“access”],
+derniere_connexion:[“connexion”,“lastlogon”,“lastlogin”,“dernier”,“last login”,“last logon”,“date connexion”],
+type_compte:       [“type”,“catégorie”,“categorie”,“account type”],
+};
+
+function autoDetect(headers, type) {
+for(const h of headers)
+if(HINTS[type]?.some(k=>h.toLowerCase().includes(k))) return h;
+return “”;
+}
+
+function suggestMap1(headers) {
+return {
+utilisateur:       autoDetect(headers,“utilisateur”)||headers[0]||””,
+application:       autoDetect(headers,“application”)||””,
+profil:            autoDetect(headers,“profil”)||””,
+derniere_connexion:autoDetect(headers,“derniere_connexion”),
+type_compte:       autoDetect(headers,“type_compte”),
+};
+}
+
+function suggestMap2(headers) {
+return {
+utilisateur: autoDetect(headers,“utilisateur”)||headers[0]||””,
+application: autoDetect(headers,“application”)||””,
+profil:      autoDetect(headers,“profil”)||””,
+};
+}
+
+function parseDate(val) {
+if(!val) return null;
+if(typeof val===‘number’) { const d=new Date((val-25569)*86400*1000); return isNaN(d)?null:d; }
+const d = new Date(String(val).trim());
+return isNaN(d)?null:d;
+}
+
+function daysSince(date) {
+if(!date) return null;
+return Math.floor((Date.now()-date.getTime())/(1000*60*60*24));
+}
+
+function addDays(date, n) {
+const d = new Date(date); d.setDate(d.getDate()+n); return d;
+}
+
+function fmtDate(val) {
+if(!val) return “—”;
+return new Date(val).toLocaleDateString(“fr-FR”);
+}
+
+function dl(content, type, name) {
+const a = document.createElement(“a”);
+a.href = URL.createObjectURL(new Blob([content],{type}));
+a.download = name; a.click();
+}
+
+// ══════════════════════════════════════════════════════════════
+// COMPUTE
+// ══════════════════════════════════════════════════════════════
+
+function computeEcarts(r1,r2,m1,m2) {
+const ok = new Set(r2.map(r=>nk(r[m2.utilisateur],r[m2.application],r[m2.profil])));
+return r1.filter(r=>!ok.has(nk(r[m1.utilisateur],r[m1.application],r[m1.profil]))).map(r=>({
+type:‘ecart’,
+utilisateur:String(r[m1.utilisateur]??””),
+application:String(r[m1.application]??””),
+profil:     String(r[m1.profil]??””),
+derniereConnexion: m1.derniere_connexion ? parseDate(r[m1.derniere_connexion]) : null,
+}));
+}
+
+function computeOrphelins(r1,r3,m1,m3) {
+if(!r3||!m3.utilisateur) return [];
+const hr = new Set(r3.map(r=>String(r[m3.utilisateur]??””).toLowerCase().trim()));
+const seen = new Set(); const out = [];
+for(const r of r1){
+const u = String(r[m1.utilisateur]??””).toLowerCase().trim();
+if(u && !hr.has(u) && !seen.has(u)){
+seen.add(u);
+out.push({
+type:‘orphelin’,
+utilisateur:String(r[m1.utilisateur]??””),
+application:String(r[m1.application]??””),
+profil:     String(r[m1.profil]??””),
+derniereConnexion: m1.derniere_connexion ? parseDate(r[m1.derniere_connexion]) : null,
+});
+}
+}
+return out;
+}
+
+function computeDormants(r1,m1) {
+if(!m1.derniere_connexion) return [];
+return r1.filter(r=>{
+const d=parseDate(r[m1.derniere_connexion]);
+const j=daysSince(d);
+return j!==null && j>DORMANT_DAYS;
+}).map(r=>({
+type:‘dormant’,
+utilisateur:String(r[m1.utilisateur]??””),
+application:String(r[m1.application]??””),
+profil:     String(r[m1.profil]??””),
+derniereConnexion: parseDate(r[m1.derniere_connexion]),
+joursInactif: daysSince(parseDate(r[m1.derniere_connexion])),
+}));
+}
+
+// ══════════════════════════════════════════════════════════════
+// EMAIL TEMPLATES
+// ══════════════════════════════════════════════════════════════
+
+function mailInitial(app, issues, resp, campaign) {
+const deadline = fmtDate(campaign?.deadline)||”[DATE LIMITE]”;
+const n = issues.length;
+const rows = issues.map((e,i)=>`  ${i+1}. ${e.utilisateur} — Profil : ${e.profil||"N/A"} — Type : ${ITYPE[e.type]?.label||e.type}`).join(”\n”);
+return `Objet : [UAR] Revue des accès – ${app} – ${n} anomalie(s) détectée(s)
+
+Bonjour ${resp.nom||”[Responsable]”},
+
+Dans le cadre de la campagne de revue périodique des accès utilisateurs (UAR${campaign?.label?` — ${campaign.label}`:””}), une analyse des droits provisionnés sur ${app} a mis en évidence ${n} anomalie(s) nécessitant votre validation.
 
 ▌ Accès concernés :
 
 ${rows}
 
-Ces droits ne disposent d'aucune demande formelle tracée, ce qui constitue un écart au regard de notre politique de gestion des habilitations.
+Pour chacun de ces accès, nous vous remercions de nous indiquer votre décision :
+• MAINTENIR — le droit est légitime et justifié au regard des fonctions actuelles
+• RÉVOQUER  — le droit doit être supprimé
 
-Nous vous remercions de bien vouloir, pour chacun des accès listés :
+⚠ Règle fail-safe : tout accès sans réponse à la date de clôture (${deadline}) sera automatiquement traité comme “À révoquer”.
 
-  1. Confirmer la légitimité du droit et soumettre, si nécessaire, un ticket de régularisation ;
-  2. Ou initier la suppression de l'accès dans les meilleurs délais.
-
-Merci de nous faire un retour avant le [DATE LIMITE] afin de clôturer cette revue dans les délais convenus.
-
-Nous restons disponibles pour tout échange complémentaire.
+Merci de nous faire un retour avant le ${deadline}.
 
 Bien cordialement,
 [Votre nom / Votre signature]`;
-    }
+}
 
-    /* ─ micro-components ─ */
-    function Badge({ children, color = "amber" }) {
-      const c = {
-        amber: { bg:"#2d1a00", text:"#fbbf24", border:"#78350f" },
-        green: { bg:"#052e16", text:"#4ade80", border:"#166534" },
-        red:   { bg:"#450a0a", text:"#f87171", border:"#991b1b" },
-        blue:  { bg:"#0c1a2e", text:"#60a5fa", border:"#1e40af" },
-        gray:  { bg:"#1c1c1c", text:"#9ca3af", border:"#374151" },
-      }[color];
-      return (
-        <span style={{
-          background:c.bg, color:c.text, border:`1px solid ${c.border}`,
-          borderRadius:4, padding:"2px 8px", fontSize:11, fontWeight:600,
-          fontFamily:"monospace", letterSpacing:"0.04em", whiteSpace:"nowrap",
-        }}>{children}</span>
-      );
-    }
+function mailRelance(app, issues, resp, campaign, type) {
+const deadline = fmtDate(campaign?.deadline)||”[DATE LIMITE]”;
+const pending = issues.filter(i=>!i._dec||i._dec===DEC.ATTENTE);
+const n = pending.length;
+const rows = pending.map((e,i)=>`  ${i+1}. ${e.utilisateur} — Profil : ${e.profil||"N/A"}`).join(”\n”);
+const isJ10 = type===‘j10’;
+return `Objet : [UAR] ${isJ10?“Relance 1/2”:“⚠ Dernière relance”} – ${app} – ${n} accès en attente
 
-    function StatCard({ label, value, sub, color }) {
-      return (
-        <div style={{ background:"#161b22", border:"1px solid #30363d", borderRadius:10, padding:"18px 22px", flex:"1 1 140px" }}>
-          <div style={{ fontSize:32, fontWeight:700, color, fontFamily:"monospace", lineHeight:1 }}>{value}</div>
-          <div style={{ fontSize:12, color:"#8b949e", marginTop:6, fontWeight:500 }}>{label}</div>
-          {sub && <div style={{ fontSize:11, color:"#6e7681", marginTop:3 }}>{sub}</div>}
+Bonjour ${resp.nom||”[Responsable]”},
+
+${isJ10
+? `Sauf erreur de notre part, nous n'avons pas encore reçu votre réponse concernant la revue des accès de ${app}, initiée il y a 10 jours.`
+: `Nous sommes à 10 jours de la clôture de la campagne de revue des accès. Passé le ${deadline}, les accès sans réponse seront automatiquement révoqués (règle fail-safe).`
+}
+
+▌ Accès toujours en attente de validation (${n}) :
+
+${rows}
+
+${isJ10
+? `Merci de nous faire un retour avant le ${deadline}.`
+: `Merci de traiter ce point en priorité avant le ${deadline}.`
+}
+
+Bien cordialement,
+[Votre nom / Votre signature]`;
+}
+
+// ══════════════════════════════════════════════════════════════
+// COMPONENTS
+// ══════════════════════════════════════════════════════════════
+
+const PAL = {
+amber:  {bg:”#2d1a00”,fg:”#fbbf24”,bd:”#78350f”},
+green:  {bg:”#052e16”,fg:”#4ade80”,bd:”#166534”},
+red:    {bg:”#450a0a”,fg:”#f87171”,bd:”#991b1b”},
+blue:   {bg:”#0c1a2e”,fg:”#60a5fa”,bd:”#1e40af”},
+gray:   {bg:”#1c1c1c”,fg:”#9ca3af”,bd:”#374151”},
+purple: {bg:”#1e0a2e”,fg:”#c084fc”,bd:”#6b21a8”},
+};
+
+function Badge({children, color=“amber”}) {
+const p=PAL[color]||PAL.gray;
+return <span style={{background:p.bg,color:p.fg,border:`1px solid ${p.bd}`,borderRadius:4,padding:“2px 8px”,fontSize:11,fontWeight:600,fontFamily:“monospace”,whiteSpace:“nowrap”}}>{children}</span>;
+}
+
+function StatCard({label, value, sub, color=”#58a6ff”}) {
+return (
+<div style={{background:”#161b22”,border:“1px solid #30363d”,borderRadius:10,padding:“16px 20px”,flex:“1 1 130px”}}>
+<div style={{fontSize:28,fontWeight:700,color,fontFamily:“monospace”,lineHeight:1}}>{value}</div>
+<div style={{fontSize:12,color:”#8b949e”,marginTop:5,fontWeight:500}}>{label}</div>
+{sub&&<div style={{fontSize:11,color:”#6e7681”,marginTop:2}}>{sub}</div>}
+</div>
+);
+}
+
+function DropZone({label, onFile, fileName, optional=false}) {
+const ref=useRef(); const [drag,setDrag]=useState(false);
+return (
+<div onClick={()=>ref.current.click()}
+onDragOver={e=>{e.preventDefault();setDrag(true);}} onDragLeave={()=>setDrag(false)}
+onDrop={e=>{e.preventDefault();setDrag(false);e.dataTransfer.files[0]&&onFile(e.dataTransfer.files[0]);}}
+style={{border:`2px dashed ${drag?"#f59e0b":fileName?"#3fb950":optional?"#21262d":"#30363d"}`,borderRadius:8,padding:“18px 14px”,textAlign:“center”,cursor:“pointer”,background:drag?”#1a1500”:”#0d1117”,transition:“all .18s”,userSelect:“none”}}>
+<input ref={ref} type=“file” accept=”.xlsx,.xls,.csv” style={{display:“none”}} onChange={e=>e.target.files[0]&&onFile(e.target.files[0])}/>
+<div style={{fontSize:22,marginBottom:5}}>{fileName?“✅”:optional?“📎”:“📂”}</div>
+<div style={{color:fileName?”#3fb950”:optional?”#4b5563”:”#8b949e”,fontSize:12,fontWeight:500}}>{fileName||label}</div>
+{optional&&!fileName&&<div style={{color:”#374151”,fontSize:10,marginTop:2}}>Optionnel</div>}
+{fileName&&<div style={{color:”#4b5563”,fontSize:10,marginTop:2}}>Cliquer pour remplacer</div>}
+</div>
+);
+}
+
+function ColMapper({headers, mapping, onChange, label, fields}) {
+if(!headers?.length) return null;
+const sel={background:”#0d1117”,border:“1px solid #30363d”,color:”#e6edf3”,borderRadius:5,padding:“4px 7px”,fontSize:12,flex:1,outline:“none”,fontFamily:“monospace”};
+return (
+<div style={{background:”#161b22”,border:“1px solid #30363d”,borderRadius:8,padding:“12px 14px”}}>
+<div style={{fontSize:10,color:”#6e7681”,marginBottom:10,textTransform:“uppercase”,letterSpacing:“0.1em”}}>{label}</div>
+<div style={{display:“flex”,flexDirection:“column”,gap:7}}>
+{fields.map(f=>(
+<div key={f.key} style={{display:“flex”,alignItems:“center”,gap:8}}>
+<span style={{fontSize:13,width:20,textAlign:“center”}}>{f.icon}</span>
+<span style={{fontSize:11,color:f.required?”#8b949e”:”#4b5563”,width:175,flexShrink:0}}>{f.label}{!f.required&&<span style={{color:”#374151”}}> (opt.)</span>}</span>
+<select value={mapping[f.key]||””} onChange={e=>onChange({…mapping,[f.key]:e.target.value})} style={sel}>
+{!f.required&&<option value="">— Non mappé —</option>}
+{headers.map(h=><option key={h} value={h}>{h}</option>)}
+</select>
+</div>
+))}
+</div>
+</div>
+);
+}
+
+function DecisionBtn({value, onChange}) {
+const opts=[
+{v:DEC.ATTENTE,  label:“En attente”, fg:”#9ca3af”, activeBg:”#1c1c1c”, activeBd:”#374151”},
+{v:DEC.MAINTENIR,label:“Maintenir”,  fg:”#4ade80”, activeBg:”#052e16”, activeBd:”#166534”},
+{v:DEC.REVOQUER, label:“Révoquer”,   fg:”#f87171”, activeBg:”#450a0a”, activeBd:”#991b1b”},
+];
+return (
+<div style={{display:“flex”,gap:3}}>
+{opts.map(o=>(
+<button key={o.v} onClick={()=>onChange(o.v)} style={{
+padding:“3px 7px”,fontSize:10,fontWeight:600,cursor:“pointer”,borderRadius:3,transition:“all .12s”,
+border:`1px solid ${value===o.v?o.activeBd:"#30363d"}`,
+background:value===o.v?o.activeBg:“transparent”,
+color:value===o.v?o.fg:”#4b5563”,
+}}>{o.label}</button>
+))}
+</div>
+);
+}
+
+// ══════════════════════════════════════════════════════════════
+// APP
+// ══════════════════════════════════════════════════════════════
+
+function App() {
+const today = new Date().toISOString().slice(0,10);
+const [campaign, setCampaign] = useState({type:‘standard’, label:’’, startDate:today, deadline:addDays(new Date(),30).toISOString().slice(0,10)});
+const [file1,setFile1]=useState(null); const [file2,setFile2]=useState(null); const [file3,setFile3]=useState(null);
+const [map1,setMap1]=useState({utilisateur:””,application:””,profil:””,derniere_connexion:””,type_compte:””});
+const [map2,setMap2]=useState({utilisateur:””,application:””,profil:””});
+const [map3,setMap3]=useState({utilisateur:””});
+const [decisions,setDecisions]=useState({});
+const [responsables,setResponsables]=useState({});
+const [relances,setRelances]=useState({});
+const [tab,setTab]=useState(“campagne”);
+const [subTab,setSubTab]=useState(“ecarts”);
+const [mailTab,setMailTab]=useState(“initial”);
+const [search,setSearch]=useState(””); const [filterApp,setFilterApp]=useState(“all”); const [filterDec,setFilterDec]=useState(“all”);
+const [copied,setCopied]=useState(null);
+const sessionRef=useRef();
+
+const handleFile = async(raw,which) => {
+try {
+const p=await parseExcel(raw);
+if(which===1){setFile1(p);setMap1(suggestMap1(p.headers));}
+else if(which===2){setFile2(p);setMap2(suggestMap2(p.headers));}
+else{setFile3(p);setMap3({utilisateur:autoDetect(p.headers,“utilisateur”)||p.headers[0]||””});}
+} catch(e){alert(“Erreur lecture : “+e.message);}
+};
+
+const setDec = (key,val) => setDecisions(p=>({…p,[key]:val}));
+const markRelance = (app,type) => setRelances(p=>({…p,[app]:{…(p[app]||{}),[type]:new Date().toISOString()}}));
+const updateResp = (app,f,v) => setResponsables(p=>({…p,[app]:{…(p[app]||{}),[f]:v}}));
+
+const ecarts    = useMemo(()=>{ if(!file1||!file2||!map1.utilisateur||!map2.utilisateur) return []; return computeEcarts(file1.rows,file2.rows,map1,map2); },[file1,file2,map1,map2]);
+const orphelins = useMemo(()=>{ if(!file1||!file3||!map1.utilisateur||!map3.utilisateur) return []; return computeOrphelins(file1.rows,file3.rows,map1,map3); },[file1,file3,map1,map3]);
+const dormants  = useMemo(()=>{ if(!file1||!map1.derniere_connexion) return []; return computeDormants(file1.rows,map1); },[file1,map1]);
+
+const allIssues = useMemo(()=>[…ecarts,…orphelins,…dormants].map(i=>({…i,_key:ik(i),_dec:decisions[ik(i)]||DEC.ATTENTE})),[ecarts,orphelins,dormants,decisions]);
+const apps = useMemo(()=>[…new Set(allIssues.map(i=>i.application))].sort(),[allIssues]);
+
+const viewIssues = useMemo(()=>{
+const src = subTab===‘ecarts’ ? ecarts : subTab===‘orphelins’ ? orphelins : subTab===‘dormants’ ? dormants : allIssues.map(i=>({…i}));
+let res = src.map(i=>({…i,_key:ik(i),_dec:decisions[ik(i)]||DEC.ATTENTE}));
+if(filterApp!==“all”) res=res.filter(i=>i.application===filterApp);
+if(filterDec!==“all”) res=res.filter(i=>i._dec===filterDec);
+if(search){const q=search.toLowerCase();res=res.filter(i=>i.utilisateur.toLowerCase().includes(q)||(i.application||””).toLowerCase().includes(q)||(i.profil||””).toLowerCase().includes(q));}
+return res;
+},[allIssues,ecarts,orphelins,dormants,decisions,subTab,filterApp,filterDec,search]);
+
+const stats = useMemo(()=>{
+const n=allIssues.length;
+return {
+total:n, ecarts:ecarts.length, orphelins:orphelins.length, dormants:dormants.length,
+maintenir:allIssues.filter(i=>i._dec===DEC.MAINTENIR).length,
+revoquer: allIssues.filter(i=>i._dec===DEC.REVOQUER).length,
+attente:  allIssues.filter(i=>i._dec===DEC.ATTENTE).length,
+pct: n>0?Math.round((allIssues.filter(i=>i._dec!==DEC.ATTENTE).length/n)*100):0,
+};
+},[allIssues,ecarts,orphelins,dormants]);
+
+const exportSession = () => {
+const s={version:2,exportedAt:new Date().toISOString(),campaign,
+file1:file1?{name:file1.name,rows:file1.rows,headers:file1.headers}:null,
+file2:file2?{name:file2.name,rows:file2.rows,headers:file2.headers}:null,
+file3:file3?{name:file3.name,rows:file3.rows,headers:file3.headers}:null,
+map1,map2,map3,decisions,responsables,relances};
+dl(JSON.stringify(s,null,2),“application/json”,`uar_session_${campaign.startDate}.json`);
+};
+
+const importSession = file => {
+const r=new FileReader();
+r.onload=e=>{
+try {
+const s=JSON.parse(e.target.result);
+if(s.campaign) setCampaign(s.campaign);
+if(s.file1) setFile1(s.file1); if(s.file2) setFile2(s.file2); if(s.file3) setFile3(s.file3);
+if(s.map1) setMap1(s.map1); if(s.map2) setMap2(s.map2); if(s.map3) setMap3(s.map3);
+if(s.decisions) setDecisions(s.decisions);
+if(s.responsables) setResponsables(s.responsables);
+if(s.relances) setRelances(s.relances);
+setTab(“analyse”);
+} catch{alert(“JSON invalide”);}
+};
+r.readAsText(file);
+};
+
+const copyText = (id,text) => {
+navigator.clipboard.writeText(text).catch(()=>{const ta=document.createElement(“textarea”);ta.value=text;document.body.appendChild(ta);ta.select();document.execCommand(“copy”);document.body.removeChild(ta);});
+setCopied(id); setTimeout(()=>setCopied(null),2200);
+};
+
+const ready=!!(file1&&file2&&map1.utilisateur&&map2.utilisateur);
+const btn=(color=”#f59e0b”,bg=“transparent”)=>({background:bg,border:`1px solid ${color}`,color,borderRadius:6,padding:“7px 14px”,fontSize:12,cursor:“pointer”,fontWeight:500,fontFamily:“system-ui,sans-serif”});
+const inp={background:”#161b22”,border:“1px solid #30363d”,color:”#e6edf3”,borderRadius:6,padding:“8px 12px”,fontSize:13,outline:“none”,fontFamily:“system-ui,sans-serif”};
+const stb=(active,off=false)=>({padding:“9px 14px”,border:“none”,background:“transparent”,borderBottom:active?“2px solid #f59e0b”:“2px solid transparent”,color:active?”#f59e0b”:off?”#374151”:”#8b949e”,cursor:off?“not-allowed”:“pointer”,fontSize:12,fontWeight:500,fontFamily:“system-ui,sans-serif”,whiteSpace:“nowrap”});
+
+const TABS=[
+{id:“campagne”,     label:“① Campagne”},
+{id:“import”,       label:“② Import”,       dot:ready},
+{id:“analyse”,      label:“③ Analyse”,       dot:allIssues.length>0, off:!ready},
+{id:“responsables”, label:“④ Responsables”,  off:!ready},
+{id:“mails”,        label:“⑤ Mails”,         off:!ready},
+{id:“bilan”,        label:“⑥ Bilan”,         off:!ready},
+];
+
+// ── ① CAMPAGNE ──────────────────────────────────────────────
+const TabCampagne = () => {
+const at=ACCOUNT_TYPES.find(a=>a.id===campaign.type)||ACCOUNT_TYPES[4];
+const start=new Date(campaign.startDate);
+return (
+<div style={{maxWidth:640}}>
+<div style={{marginBottom:18,padding:“12px 16px”,background:”#0c1a2e”,border:“1px solid #1e40af”,borderRadius:8}}>
+<div style={{fontSize:12,color:”#60a5fa”,fontWeight:600,marginBottom:4}}>Fréquences de revue selon la politique</div>
+<div style={{fontSize:11,color:”#8b949e”,lineHeight:1.9}}>
+Admins / PAM → Mensuelle  ·  Admin applicatif → Trimestrielle  ·  Service → Semestrielle<br/>
+Prestataires → Trimestrielle  ·  Utilisateurs standard → Annuelle  ·  Dormants → Mensuelle
+</div>
+</div>
+
+```
+    <div style={{display:"flex",flexDirection:"column",gap:14}}>
+      <div>
+        <label style={{fontSize:11,color:"#8b949e",textTransform:"uppercase",letterSpacing:"0.08em",display:"block",marginBottom:5}}>Type de campagne</label>
+        <select value={campaign.type} onChange={e=>{
+          const at2=ACCOUNT_TYPES.find(a=>a.id===e.target.value);
+          setCampaign(p=>({...p,type:e.target.value,deadline:addDays(new Date(p.startDate),at2?.days||30).toISOString().slice(0,10)}));
+        }} style={{...inp,width:"100%"}}>
+          {ACCOUNT_TYPES.map(a=><option key={a.id} value={a.id}>{a.label} — {a.frequence}</option>)}
+        </select>
+      </div>
+      <div>
+        <label style={{fontSize:11,color:"#8b949e",textTransform:"uppercase",letterSpacing:"0.08em",display:"block",marginBottom:5}}>Libellé de la campagne</label>
+        <input value={campaign.label} onChange={e=>setCampaign(p=>({...p,label:e.target.value}))}
+          placeholder={`UAR ${at.label} — ${new Date().getFullYear()}`} style={{...inp,width:"100%"}}/>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
+        <div>
+          <label style={{fontSize:11,color:"#8b949e",textTransform:"uppercase",letterSpacing:"0.08em",display:"block",marginBottom:5}}>Date de lancement</label>
+          <input type="date" value={campaign.startDate} onChange={e=>{
+            const at2=ACCOUNT_TYPES.find(a=>a.id===campaign.type);
+            setCampaign(p=>({...p,startDate:e.target.value,deadline:addDays(new Date(e.target.value),at2?.days||30).toISOString().slice(0,10)}));
+          }} style={{...inp,width:"100%"}}/>
         </div>
-      );
-    }
-
-    function DropZone({ label, onFile, fileName }) {
-      const ref = useRef();
-      const [drag, setDrag] = useState(false);
-      const handle = f => f && onFile(f);
-      return (
-        <div
-          onClick={() => ref.current.click()}
-          onDragOver={e => { e.preventDefault(); setDrag(true); }}
-          onDragLeave={() => setDrag(false)}
-          onDrop={e => { e.preventDefault(); setDrag(false); handle(e.dataTransfer.files[0]); }}
-          style={{
-            border:`2px dashed ${drag?"#f59e0b":fileName?"#3fb950":"#30363d"}`,
-            borderRadius:8, padding:"22px 16px", textAlign:"center", cursor:"pointer",
-            background:drag?"#1a1500":"#0d1117", transition:"all 0.18s", userSelect:"none",
-          }}
-        >
-          <input ref={ref} type="file" accept=".xlsx,.xls,.csv" style={{ display:"none" }}
-            onChange={e => handle(e.target.files[0])} />
-          <div style={{ fontSize:26, marginBottom:8 }}>{fileName?"✅":"📂"}</div>
-          <div style={{ color:fileName?"#3fb950":"#8b949e", fontSize:12, fontWeight:500 }}>
-            {fileName ? fileName : label}
-          </div>
-          {fileName && <div style={{ color:"#4b5563", fontSize:11, marginTop:3 }}>Cliquer pour remplacer</div>}
+        <div>
+          <label style={{fontSize:11,color:"#8b949e",textTransform:"uppercase",letterSpacing:"0.08em",display:"block",marginBottom:5}}>Clôture (J+{at.days})</label>
+          <input type="date" value={campaign.deadline} onChange={e=>setCampaign(p=>({...p,deadline:e.target.value}))} style={{...inp,width:"100%"}}/>
         </div>
-      );
-    }
+      </div>
+    </div>
 
-    function ColMapper({ headers, mapping, onChange, label }) {
-      const fields = [
-        { key:"utilisateur", label:"Utilisateur / Login", icon:"👤" },
-        { key:"application", label:"Application / Système", icon:"🖥️" },
-        { key:"profil",      label:"Profil / Rôle",        icon:"🔑" },
-      ];
-      const sel = {
-        background:"#0d1117", border:"1px solid #30363d", color:"#e6edf3",
-        borderRadius:5, padding:"5px 8px", fontSize:12, flex:1, outline:"none", fontFamily:"monospace",
-      };
-      return (
-        <div style={{ background:"#161b22", border:"1px solid #30363d", borderRadius:8, padding:"14px 16px" }}>
-          <div style={{ fontSize:10, color:"#6e7681", marginBottom:12, textTransform:"uppercase", letterSpacing:"0.1em" }}>{label}</div>
-          <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
-            {fields.map(f => (
-              <div key={f.key} style={{ display:"flex", alignItems:"center", gap:10 }}>
-                <span style={{ fontSize:14, width:22, textAlign:"center" }}>{f.icon}</span>
-                <span style={{ fontSize:11, color:"#8b949e", width:155, flexShrink:0 }}>{f.label}</span>
-                <select value={mapping[f.key]} onChange={e => onChange({...mapping,[f.key]:e.target.value})} style={sel}>
-                  {headers.map(h => <option key={h} value={h}>{h}</option>)}
-                </select>
-              </div>
-            ))}
-          </div>
+    <div style={{marginTop:18,background:"#161b22",border:"1px solid #30363d",borderRadius:8,padding:"14px 16px"}}>
+      <div style={{fontSize:10,color:"#6e7681",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:10}}>Calendrier de la campagne</div>
+      {[
+        {label:"Lancement",        date:fmtDate(campaign.startDate),            color:"#3fb950"},
+        {label:"Relance 1 (J+10)", date:fmtDate(addDays(start,10)),              color:"#f59e0b"},
+        {label:"Relance 2 (J+20)", date:fmtDate(addDays(start,20)),              color:"#f59e0b"},
+        {label:`Clôture (J+${at.days})`, date:fmtDate(campaign.deadline),        color:"#f85149"},
+      ].map(item=>(
+        <div key={item.label} style={{display:"flex",alignItems:"center",gap:10,marginBottom:7}}>
+          <div style={{width:7,height:7,borderRadius:"50%",background:item.color,flexShrink:0}}/>
+          <span style={{fontSize:12,color:"#8b949e",width:155}}>{item.label}</span>
+          <span style={{fontSize:12,color:item.color,fontFamily:"monospace",fontWeight:600}}>{item.date}</span>
         </div>
-      );
-    }
+      ))}
+    </div>
+    <div style={{marginTop:14,display:"flex",justifyContent:"flex-end"}}>
+      <button style={btn("#4ade80","#052e16")} onClick={()=>setTab("import")}>Configurer les imports →</button>
+    </div>
+  </div>
+);
+```
 
-    /* ─ App ─ */
-    function App() {
-      const [tab, setTab] = useState("import");
-      const [file1, setFile1] = useState(null);
-      const [file2, setFile2] = useState(null);
-      const [map1, setMap1] = useState({ utilisateur:"", application:"", profil:"" });
-      const [map2, setMap2] = useState({ utilisateur:"", application:"", profil:"" });
-      const [responsables, setResponsables] = useState({});
-      const [search, setSearch] = useState("");
-      const [filterApp, setFilterApp] = useState("all");
-      const [copiedId, setCopiedId] = useState(null);
-      const sessionRef = useRef();
+};
 
-      const handleFile = async (raw, which) => {
-        try {
-          const parsed = await parseExcel(raw);
-          const mapping = suggestMapping(parsed.headers);
-          if (which === 1) { setFile1({...parsed, name:raw.name}); setMap1(mapping); }
-          else             { setFile2({...parsed, name:raw.name}); setMap2(mapping); }
-        } catch (e) { alert("Erreur de lecture : " + e.message); }
-      };
+// ── ② IMPORT ───────────────────────────────────────────────
+const TabImport = () => (
+<div style={{display:“flex”,flexDirection:“column”,gap:18}}>
+<div style={{display:“grid”,gridTemplateColumns:“1fr 1fr”,gap:18}}>
+<div>
+<div style={{marginBottom:7,fontSize:11,color:”#8b949e”,textTransform:“uppercase”,letterSpacing:“0.1em”}}>Fichier 1 — Droits réels (AD / IAM)</div>
+<DropZone label=“Déposer · .xlsx / .xls / .csv” onFile={f=>handleFile(f,1)} fileName={file1?.name}/>
+{file1&&<div style={{marginTop:8}}>
+<ColMapper headers={file1.headers} mapping={map1} onChange={setMap1} label=“Mapping colonnes” fields={[
+{key:“utilisateur”,       label:“Utilisateur / Login”,     icon:“👤”,required:true},
+{key:“application”,       label:“Application / Système”,   icon:“🖥️”,required:true},
+{key:“profil”,            label:“Profil / Rôle”,           icon:“🔑”,required:true},
+{key:“derniere_connexion”,label:“Dernière connexion”,      icon:“📅”,required:false},
+{key:“type_compte”,       label:“Type de compte”,          icon:“🏷️”,required:false},
+]}/>
+<div style={{fontSize:11,color:”#6e7681”,marginTop:5}}>{file1.rows.length.toLocaleString(“fr-FR”)} lignes · {file1.name}</div>
+</div>}
+</div>
+<div>
+<div style={{marginBottom:7,fontSize:11,color:”#8b949e”,textTransform:“uppercase”,letterSpacing:“0.1em”}}>Fichier 2 — Habilitations autorisées (ticketing)</div>
+<DropZone label=“Déposer · .xlsx / .xls / .csv” onFile={f=>handleFile(f,2)} fileName={file2?.name}/>
+{file2&&<div style={{marginTop:8}}>
+<ColMapper headers={file2.headers} mapping={map2} onChange={setMap2} label=“Mapping colonnes” fields={[
+{key:“utilisateur”, label:“Utilisateur / Login”,   icon:“👤”,required:true},
+{key:“application”, label:“Application / Système”, icon:“🖥️”,required:true},
+{key:“profil”,      label:“Profil / Rôle”,         icon:“🔑”,required:true},
+]}/>
+<div style={{fontSize:11,color:”#6e7681”,marginTop:5}}>{file2.rows.length.toLocaleString(“fr-FR”)} lignes · {file2.name}</div>
+</div>}
+</div>
+</div>
+<div style={{borderTop:“1px solid #21262d”,paddingTop:16}}>
+<div style={{marginBottom:7,fontSize:11,color:”#4b5563”,textTransform:“uppercase”,letterSpacing:“0.1em”}}>
+Fichier 3 — Liste RH des collaborateurs en poste <span style={{color:”#374151”}}>(optionnel — détection orphelins)</span>
+</div>
+<div style={{maxWidth:360}}>
+<DropZone label=“Déposer · .xlsx / .xls / .csv” onFile={f=>handleFile(f,3)} fileName={file3?.name} optional={true}/>
+{file3&&<div style={{marginTop:8}}>
+<ColMapper headers={file3.headers} mapping={map3} onChange={setMap3} label=“Colonne identifiant RH” fields={[
+{key:“utilisateur”,label:“Login / Matricule RH”,icon:“👤”,required:true},
+]}/>
+<div style={{fontSize:11,color:”#6e7681”,marginTop:5}}>{file3.rows.length.toLocaleString(“fr-FR”)} collaborateurs · {file3.name}</div>
+</div>}
+</div>
+</div>
+{ready&&(
+<div style={{padding:“13px 16px”,background:”#042012”,border:“1px solid #166534”,borderRadius:8,display:“flex”,alignItems:“center”,justifyContent:“space-between”,flexWrap:“wrap”,gap:8}}>
+<div style={{display:“flex”,gap:14,alignItems:“center”}}>
+<span style={{color:”#4ade80”,fontSize:13}}>✓ Fichiers chargés</span>
+{map1.derniere_connexion&&<Badge color="blue">Détection dormants ✓</Badge>}
+{file3&&<Badge color="red">Détection orphelins ✓</Badge>}
+</div>
+<button style={btn(”#4ade80”,”#052e16”)} onClick={()=>setTab(“analyse”)}>Analyser →</button>
+</div>
+)}
+</div>
+);
 
-      const ecarts = useMemo(() => {
-        if (!file1||!file2||!map1.utilisateur||!map2.utilisateur) return [];
-        return computeEcarts(file1.rows, file2.rows, map1, map2);
-      }, [file1, file2, map1, map2]);
+// ── ③ ANALYSE ──────────────────────────────────────────────
+const TabAnalyse = () => (
+<div>
+<div style={{display:“flex”,gap:10,marginBottom:18,flexWrap:“wrap”}}>
+<StatCard label="Total anomalies"  value={stats.total}     color="#f59e0b"/>
+<StatCard label="Sans ticket"      value={stats.ecarts}    color="#fbbf24" sub="droits non justifiés"/>
+<StatCard label=“Orphelins”        value={stats.orphelins} color=”#f87171” sub={file3?“sans corresp. RH”:”(fichier RH manquant)”}/>
+<StatCard label=“Dormants >90j”    value={stats.dormants}  color=”#60a5fa” sub={map1.derniere_connexion?“inactifs”:”(date non mappée)”}/>
+<StatCard label="Décision attente" value={stats.attente}   color="#9ca3af"/>
+<StatCard label="À révoquer"       value={stats.revoquer}  color="#f85149"/>
+</div>
 
-      const apps = useMemo(() => [...new Set(ecarts.map(e => e.application))].sort(), [ecarts]);
+```
+  <div style={{display:"flex",borderBottom:"1px solid #21262d",marginBottom:12}}>
+    {[
+      {id:"ecarts",    label:`Sans ticket (${ecarts.length})`},
+      {id:"orphelins", label:`Orphelins (${orphelins.length})`,  off:!file3},
+      {id:"dormants",  label:`Dormants (${dormants.length})`,    off:!map1.derniere_connexion},
+      {id:"all",       label:`Vue globale (${allIssues.length})`},
+    ].map(t=><button key={t.id} onClick={()=>!t.off&&setSubTab(t.id)} style={stb(subTab===t.id,t.off)}>{t.label}</button>)}
+  </div>
 
-      const filtered = useMemo(() => {
-        let res = ecarts;
-        if (filterApp !== "all") res = res.filter(e => e.application === filterApp);
-        if (search) {
-          const q = search.toLowerCase();
-          res = res.filter(e =>
-            e.utilisateur.toLowerCase().includes(q) ||
-            e.application.toLowerCase().includes(q) ||
-            e.profil.toLowerCase().includes(q)
+  <div style={{display:"flex",gap:8,marginBottom:10,flexWrap:"wrap"}}>
+    <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Rechercher…" style={{...inp,flex:"1 1 180px"}}/>
+    <select value={filterApp} onChange={e=>setFilterApp(e.target.value)} style={{...inp,minWidth:170}}>
+      <option value="all">Toutes applis ({allIssues.length})</option>
+      {apps.map(a=><option key={a} value={a}>{a} ({allIssues.filter(i=>i.application===a).length})</option>)}
+    </select>
+    <select value={filterDec} onChange={e=>setFilterDec(e.target.value)} style={inp}>
+      <option value="all">Toutes décisions</option>
+      <option value={DEC.ATTENTE}>En attente</option>
+      <option value={DEC.MAINTENIR}>Maintenir</option>
+      <option value={DEC.REVOQUER}>Révoquer</option>
+    </select>
+    <button style={btn("#8b949e")} onClick={()=>{
+      const csv="Type,Utilisateur,Application,Profil,Décision,Dernière connexion\n"+
+        viewIssues.map(i=>`"${ITYPE[i.type]?.label||i.type}","${i.utilisateur}","${i.application}","${i.profil||""}","${i._dec}","${i.derniereConnexion?fmtDate(i.derniereConnexion):""}"`).join("\n");
+      dl(csv,"text/csv;charset=utf-8",`uar_ecarts_${campaign.startDate}.csv`);
+    }}>↓ CSV</button>
+    {stats.attente>0&&(
+      <button style={btn("#f85149","#450a0a")} onClick={()=>{
+        const nd={...decisions};
+        allIssues.filter(i=>i._dec===DEC.ATTENTE).forEach(i=>{nd[i._key]=DEC.REVOQUER;});
+        setDecisions(nd);
+      }}>⚠ Fail-safe — Tout révoquer ({stats.attente})</button>
+    )}
+  </div>
+
+  <div style={{border:"1px solid #30363d",borderRadius:8,overflow:"hidden"}}>
+    <table style={{width:"100%",borderCollapse:"collapse"}}>
+      <thead><tr style={{background:"#161b22"}}>
+        {["#","Utilisateur","Application","Profil","Type","Dernière cnx","Décision"].map(h=>(
+          <th key={h} style={{padding:"9px 11px",textAlign:"left",fontSize:10,fontWeight:600,color:"#8b949e",textTransform:"uppercase",letterSpacing:"0.1em",borderBottom:"1px solid #30363d"}}>{h}</th>
+        ))}
+      </tr></thead>
+      <tbody>
+        {viewIssues.length===0?(
+          <tr><td colSpan={7} style={{padding:36,textAlign:"center",color:"#8b949e"}}>
+            {allIssues.length===0?"🎉 Aucune anomalie":"Aucun résultat pour ces filtres"}
+          </td></tr>
+        ):viewIssues.map((issue,i)=>{
+          const jours = issue.derniereConnexion ? (issue.joursInactif??daysSince(issue.derniereConnexion)) : null;
+          return (
+            <tr key={i} style={{borderBottom:"1px solid #21262d",background:i%2===0?"transparent":"#0a0e14"}}>
+              <td style={{padding:"8px 11px",color:"#4b5563",fontSize:11,fontFamily:"monospace"}}>{i+1}</td>
+              <td style={{padding:"8px 11px",fontFamily:"monospace",fontSize:12}}>{issue.utilisateur}</td>
+              <td style={{padding:"8px 11px"}}><Badge color="blue">{issue.application||"—"}</Badge></td>
+              <td style={{padding:"8px 11px",fontFamily:"monospace",fontSize:11,color:"#c9d1d9"}}>{issue.profil||"—"}</td>
+              <td style={{padding:"8px 11px"}}><Badge color={ITYPE[issue.type]?.color||"gray"}>{ITYPE[issue.type]?.label||issue.type}</Badge></td>
+              <td style={{padding:"8px 11px",fontSize:11,fontFamily:"monospace",color:jours>90?"#f87171":"#8b949e"}}>
+                {issue.derniereConnexion ? `${fmtDate(issue.derniereConnexion)} (${jours}j)` : "—"}
+              </td>
+              <td style={{padding:"8px 11px"}}><DecisionBtn value={issue._dec} onChange={v=>setDec(issue._key,v)}/></td>
+            </tr>
           );
-        }
-        return res;
-      }, [ecarts, filterApp, search]);
+        })}
+      </tbody>
+    </table>
+  </div>
+  {viewIssues.length>0&&viewIssues.length<allIssues.length&&(
+    <div style={{textAlign:"right",fontSize:11,color:"#6e7681",marginTop:5}}>{viewIssues.length} / {allIssues.length} affichés</div>
+  )}
+  {allIssues.length>0&&<div style={{marginTop:12,display:"flex",justifyContent:"flex-end"}}>
+    <button style={btn("#f59e0b","#1c1407")} onClick={()=>setTab("responsables")}>Responsables →</button>
+  </div>}
+</div>
+```
 
-      const updateResp = (app, field, val) =>
-        setResponsables(p => ({...p, [app]:{...(p[app]||{}), [field]:val}}));
+);
 
-      const exportSession = () => {
-        const s = {
-          exportedAt: new Date().toISOString(),
-          file1: file1 ? {name:file1.name, rows:file1.rows, headers:file1.headers} : null,
-          file2: file2 ? {name:file2.name, rows:file2.rows, headers:file2.headers} : null,
-          map1, map2, responsables, ecarts,
-        };
-        const a = document.createElement("a");
-        a.href = URL.createObjectURL(new Blob([JSON.stringify(s,null,2)], {type:"application/json"}));
-        a.download = `uar_session_${new Date().toISOString().slice(0,10)}.json`;
-        a.click();
-      };
+// ── ④ RESPONSABLES ─────────────────────────────────────────
+const TabResponsables = () => (
+<div>
+<p style={{color:”#8b949e”,marginBottom:14,fontSize:13,lineHeight:1.7}}>
+Renseignez le responsable métier validateur pour chaque application en anomalie.
+</p>
+{apps.length===0?<div style={{textAlign:“center”,color:”#8b949e”,padding:40}}>Aucune anomalie détectée</div>:(
+<div style={{display:“flex”,flexDirection:“column”,gap:8}}>
+{apps.map(app=>{
+const r=responsables[app]||{}, count=allIssues.filter(i=>i.application===app).length, done=!!(r.nom&&r.email);
+return(
+<div key={app} style={{background:”#161b22”,border:`1px solid ${done?"#166534":"#30363d"}`,borderRadius:8,padding:“12px 16px”,display:“flex”,alignItems:“center”,gap:12,flexWrap:“wrap”}}>
+<div style={{flex:“0 0 200px”}}>
+<div style={{fontFamily:“monospace”,fontWeight:600,color:”#60a5fa”,fontSize:13}}>{app}</div>
+<div style={{marginTop:4,display:“flex”,gap:4,flexWrap:“wrap”}}>
+{ecarts.filter(i=>i.application===app).length>0&&<Badge color="amber">{ecarts.filter(i=>i.application===app).length} écart{ecarts.filter(i=>i.application===app).length>1?“s”:””}</Badge>}
+{orphelins.filter(i=>i.application===app).length>0&&<Badge color="red">{orphelins.filter(i=>i.application===app).length} orphelin{orphelins.filter(i=>i.application===app).length>1?“s”:””}</Badge>}
+{dormants.filter(i=>i.application===app).length>0&&<Badge color="blue">{dormants.filter(i=>i.application===app).length} dormant{dormants.filter(i=>i.application===app).length>1?“s”:””}</Badge>}
+</div>
+</div>
+<input value={r.nom||””} onChange={e=>updateResp(app,“nom”,e.target.value)} placeholder=“Nom du responsable” style={{…inp,flex:“1 1 150px”}}/>
+<input value={r.email||””} onChange={e=>updateResp(app,“email”,e.target.value)} placeholder=“email@entreprise.com” type=“email” style={{…inp,flex:“1 1 190px”}}/>
+<span style={{fontSize:16}}>{done?“✅”:“○”}</span>
+</div>
+);
+})}
+</div>
+)}
+<div style={{marginTop:14,display:“flex”,justifyContent:“flex-end”}}>
+<button style={btn(”#f59e0b”,”#1c1407”)} onClick={()=>setTab(“mails”)}>Générer les mails →</button>
+</div>
+</div>
+);
 
-      const importSession = file => {
-        const r = new FileReader();
-        r.onload = e => {
-          try {
-            const s = JSON.parse(e.target.result);
-            if (s.file1) setFile1(s.file1);
-            if (s.file2) setFile2(s.file2);
-            if (s.map1) setMap1(s.map1);
-            if (s.map2) setMap2(s.map2);
-            if (s.responsables) setResponsables(s.responsables);
-            setTab("analyse");
-          } catch { alert("Fichier JSON invalide"); }
-        };
-        r.readAsText(file);
-      };
+// ── ⑤ MAILS ────────────────────────────────────────────────
+const TabMails = () => (
+<div>
+<div style={{display:“flex”,borderBottom:“1px solid #21262d”,marginBottom:16}}>
+{[
+{id:“initial”,label:“Mail initial”},
+{id:“j10”,    label:“Relance J+10”},
+{id:“j20”,    label:“Relance J+20”},
+].map(t=><button key={t.id} onClick={()=>setMailTab(t.id)} style={stb(mailTab===t.id)}>{t.label}</button>)}
+</div>
+<p style={{color:”#8b949e”,marginBottom:14,fontSize:12,lineHeight:1.7}}>
+{mailTab===“initial”&&“Mail de lancement à envoyer à chaque responsable. Remplacez [DATE LIMITE] si besoin.”}
+{mailTab===“j10”&&“À envoyer 10 jours après le lancement, uniquement aux responsables sans réponse.”}
+{mailTab===“j20”&&“Dernière relance avant clôture. Après envoi, appliquez le fail-safe si nécessaire.”}
+</p>
+{apps.length===0?<div style={{textAlign:“center”,color:”#8b949e”,padding:40}}>🎉 Aucune anomalie</div>:(
+<div style={{display:“flex”,flexDirection:“column”,gap:14}}>
+{apps.map(app=>{
+const appIssues=allIssues.filter(i=>i.application===app);
+const resp=responsables[app]||{};
+const pending=appIssues.filter(i=>i._dec===DEC.ATTENTE);
+const mailText = mailTab===“initial”
+? mailInitial(app,appIssues,resp,campaign)
+: mailRelance(app,appIssues.map(i=>({…i,_dec:decisions[ik(i)]||DEC.ATTENTE})),resp,campaign,mailTab);
+const id=`mail_${mailTab}_${app}`;
+const isCopied=copied===id;
+const sent=relances[app]?.[mailTab];
+if(mailTab!==“initial”&&pending.length===0) return (
+<div key={app} style={{border:“1px solid #166534”,borderRadius:8,padding:“12px 16px”,display:“flex”,alignItems:“center”,gap:10,background:”#042012”}}>
+<span style={{fontSize:18}}>✅</span>
+<span style={{fontFamily:“monospace”,color:”#60a5fa”,fontWeight:600}}>{app}</span>
+<span style={{fontSize:12,color:”#4ade80”}}>Toutes les décisions saisies — aucune relance nécessaire</span>
+</div>
+);
+return(
+<div key={app} style={{border:`1px solid ${sent?"#166534":"#30363d"}`,borderRadius:8,overflow:“hidden”}}>
+<div style={{padding:“10px 14px”,background:”#0f131a”,borderBottom:“1px solid #30363d”,display:“flex”,alignItems:“center”,justifyContent:“space-between”,flexWrap:“wrap”,gap:8}}>
+<div style={{display:“flex”,alignItems:“center”,gap:10}}>
+<span style={{fontWeight:600,color:”#60a5fa”,fontFamily:“monospace”}}>{app}</span>
+<Badge color="amber">{(mailTab===“initial”?appIssues:pending).length} anomalie{(mailTab===“initial”?appIssues:pending).length>1?“s”:””}</Badge>
+{resp.email?<span style={{color:”#8b949e”,fontSize:11}}>→ {resp.email}</span>:<Badge color="gray">Email manquant</Badge>}
+{sent&&<span style={{fontSize:10,color:”#4ade80”}}>✓ {fmtDate(sent)}</span>}
+</div>
+<div style={{display:“flex”,gap:6}}>
+{resp.email&&(
+<a onClick={()=>markRelance(app,mailTab)}
+href={`mailto:${resp.email}?subject=${encodeURIComponent(`[UAR] ${mailTab===“initial”?“Revue des accès”:mailTab===“j10”?“Relance 1/2”:“⚠ Dernière relance”} – ${app}`)}&body=${encodeURIComponent(mailText)}`}
+style={{…btn(”#8b949e”),textDecoration:“none”,display:“inline-block”}}>✉ Ouvrir dans Mail</a>
+)}
+<button onClick={()=>{copyText(id,mailText);if(mailTab!==“initial”)markRelance(app,mailTab);}}
+style={btn(isCopied?”#4ade80”:”#f59e0b”,isCopied?”#052e16”:”#1c1407”)}>{isCopied?“✓ Copié !”:“⧉ Copier”}</button>
+</div>
+</div>
+<pre style={{margin:0,padding:“14px 16px”,fontSize:11,lineHeight:1.75,color:”#c9d1d9”,fontFamily:“monospace”,whiteSpace:“pre-wrap”,wordBreak:“break-word”,maxHeight:280,overflowY:“auto”,background:”#0d1117”}}>{mailText}</pre>
+</div>
+);
+})}
+</div>
+)}
+</div>
+);
 
-      const exportCSV = () => {
-        const csv = "Utilisateur,Application,Profil\n" +
-          ecarts.map(e => `"${e.utilisateur}","${e.application}","${e.profil}"`).join("\n");
-        const a = document.createElement("a");
-        a.href = URL.createObjectURL(new Blob([csv], {type:"text/csv;charset=utf-8"}));
-        a.download = `ecarts_uar_${new Date().toISOString().slice(0,10)}.csv`;
-        a.click();
-      };
+// ── ⑥ BILAN ────────────────────────────────────────────────
+const TabBilan = () => {
+const at=ACCOUNT_TYPES.find(a=>a.id===campaign.type)||ACCOUNT_TYPES[4];
+const pctColor=stats.pct>80?”#3fb950”:stats.pct>50?”#f59e0b”:”#f85149”;
+const revocation=allIssues.filter(i=>i._dec===DEC.REVOQUER);
+const checklist=[
+{ok:ready,                                                      label:“Fichiers importés et mappés”},
+{ok:stats.total>0,                                              label:“Anomalies identifiées”},
+{ok:stats.attente===0,                                          label:“Toutes les décisions saisies (fail-safe levé)”},
+{ok:apps.every(a=>responsables[a]?.nom&&responsables[a]?.email),label:“Responsables renseignés pour toutes les applications”},
+{ok:apps.every(a=>relances[a]?.initial),                        label:“Mails initiaux envoyés”},
+{ok:apps.some(a=>relances[a]?.j10),                             label:“Relance J+10 effectuée”},
+{ok:apps.some(a=>relances[a]?.j20)||stats.attente===0,          label:“Relance J+20 ou decisions complètes”},
+{ok:revocation.length>0||stats.total===0,                       label:“Liste de révocation compilée pour la DSI”},
+];
+const exportBilan=()=>{
+const b={
+campagne:{…campaign,type_label:at.label,frequence:at.frequence},
+stats,
+par_application:apps.map(app=>({
+application:app, responsable:responsables[app]||{},
+total:allIssues.filter(i=>i.application===app).length,
+maintenir:allIssues.filter(i=>i.application===app&&i._dec===DEC.MAINTENIR).length,
+revoquer: allIssues.filter(i=>i.application===app&&i._dec===DEC.REVOQUER).length,
+attente:  allIssues.filter(i=>i.application===app&&i._dec===DEC.ATTENTE).length,
+})),
+revocations:revocation,
+checklist:checklist.map(c=>({label:c.label,ok:c.ok})),
+generatedAt:new Date().toISOString(),
+};
+dl(JSON.stringify(b,null,2),“application/json”,`uar_bilan_${campaign.startDate}.json`);
+};
+return (
+<div>
+<div style={{display:“grid”,gridTemplateColumns:“1fr 1fr”,gap:18,marginBottom:20}}>
+<div style={{background:”#161b22”,border:“1px solid #30363d”,borderRadius:8,padding:“14px 16px”}}>
+<div style={{fontSize:10,color:”#6e7681”,textTransform:“uppercase”,letterSpacing:“0.1em”,marginBottom:10}}>Campagne</div>
+{[[“Type”,at.label],[“Fréquence”,at.frequence],[“Libellé”,campaign.label||”—”],[“Lancement”,fmtDate(campaign.startDate)],[“Clôture”,fmtDate(campaign.deadline)]].map(([k,v])=>(
+<div key={k} style={{display:“flex”,justifyContent:“space-between”,marginBottom:6,fontSize:12}}>
+<span style={{color:”#8b949e”}}>{k}</span><span style={{color:”#e6edf3”,fontWeight:500}}>{v}</span>
+</div>
+))}
+</div>
+<div style={{background:”#161b22”,border:“1px solid #30363d”,borderRadius:8,padding:“14px 16px”}}>
+<div style={{fontSize:10,color:”#6e7681”,textTransform:“uppercase”,letterSpacing:“0.1em”,marginBottom:10}}>Résultats</div>
+{[[“Total anomalies”,stats.total,”#f59e0b”],[“→ Sans ticket”,stats.ecarts,”#fbbf24”],[“→ Orphelins”,stats.orphelins,”#f87171”],[“→ Dormants”,stats.dormants,”#60a5fa”],[“Maintenir”,stats.maintenir,”#3fb950”],[“Révoquer”,stats.revoquer,”#f85149”],[“En attente”,stats.attente,”#9ca3af”]].map(([k,v,c])=>(
+<div key={k} style={{display:“flex”,justifyContent:“space-between”,marginBottom:6,fontSize:12}}>
+<span style={{color:”#8b949e”}}>{k}</span><span style={{color:c,fontWeight:600,fontFamily:“monospace”}}>{v}</span>
+</div>
+))}
+<div style={{marginTop:10,paddingTop:8,borderTop:“1px solid #21262d”,display:“flex”,justifyContent:“space-between”,alignItems:“center”}}>
+<span style={{fontSize:12,color:”#8b949e”}}>Taux de traitement</span>
+<span style={{fontSize:18,fontWeight:700,color:pctColor,fontFamily:“monospace”}}>{stats.pct}%</span>
+</div>
+</div>
+</div>
 
-      const copy = (id, text) => {
-        navigator.clipboard.writeText(text).catch(() => {
-          const ta = document.createElement("textarea");
-          ta.value = text; document.body.appendChild(ta);
-          ta.select(); document.execCommand("copy"); document.body.removeChild(ta);
-        });
-        setCopiedId(id);
-        setTimeout(() => setCopiedId(null), 2200);
-      };
-
-      const ready = !!(file1 && file2 && map1.utilisateur && map2.utilisateur);
-
-      const btn = (color="#f59e0b", bg="transparent") => ({
-        background:bg, border:`1px solid ${color}`, color,
-        borderRadius:6, padding:"7px 14px", fontSize:12, cursor:"pointer",
-        fontWeight:500, fontFamily:"sans-serif",
-      });
-      const input = {
-        background:"#161b22", border:"1px solid #30363d", color:"#e6edf3",
-        borderRadius:6, padding:"8px 12px", fontSize:13, outline:"none", fontFamily:"sans-serif",
-      };
-
-      const TABS = [
-        { id:"import",       label:"① Import",       dot:ready },
-        { id:"analyse",      label:"② Analyse",       dot:ecarts.length>0, off:!ready },
-        { id:"responsables", label:"③ Responsables",  dot:apps.some(a=>responsables[a]?.nom), off:!ready },
-        { id:"mails",        label:"④ Mails",         dot:false, off:!ready },
-      ];
-
-      /* ── IMPORT ── */
-      const TabImport = () => (
-        <div>
-          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:20 }}>
-            <div>
-              <div style={{ marginBottom:10, fontSize:11, color:"#8b949e", textTransform:"uppercase", letterSpacing:"0.1em" }}>
-                Fichier 1 — Droits réels applicatifs
-              </div>
-              <DropZone label="Déposer ou cliquer · .xlsx / .xls / .csv" onFile={f=>handleFile(f,1)} fileName={file1?.name} />
-              {file1 && (
-                <div style={{ marginTop:12 }}>
-                  <ColMapper headers={file1.headers} mapping={map1} onChange={setMap1} label="Mapping colonnes — Fichier 1" />
-                  <div style={{ fontSize:11, color:"#6e7681", marginTop:6 }}>{file1.rows.length.toLocaleString("fr-FR")} lignes chargées</div>
-                </div>
-              )}
-            </div>
-            <div>
-              <div style={{ marginBottom:10, fontSize:11, color:"#8b949e", textTransform:"uppercase", letterSpacing:"0.1em" }}>
-                Fichier 2 — Habilitations autorisées (ticketing)
-              </div>
-              <DropZone label="Déposer ou cliquer · .xlsx / .xls / .csv" onFile={f=>handleFile(f,2)} fileName={file2?.name} />
-              {file2 && (
-                <div style={{ marginTop:12 }}>
-                  <ColMapper headers={file2.headers} mapping={map2} onChange={setMap2} label="Mapping colonnes — Fichier 2" />
-                  <div style={{ fontSize:11, color:"#6e7681", marginTop:6 }}>{file2.rows.length.toLocaleString("fr-FR")} lignes chargées</div>
-                </div>
-              )}
-            </div>
+```
+    <div style={{background:"#161b22",border:"1px solid #30363d",borderRadius:8,padding:"14px 16px",marginBottom:18}}>
+      <div style={{fontSize:10,color:"#6e7681",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:10}}>Checklist de clôture ISO 27001</div>
+      <div style={{display:"flex",flexDirection:"column",gap:7}}>
+        {checklist.map((c,i)=>(
+          <div key={i} style={{display:"flex",alignItems:"center",gap:9}}>
+            <span style={{fontSize:13,width:18,textAlign:"center"}}>{c.ok?"✅":"⬜"}</span>
+            <span style={{fontSize:12,color:c.ok?"#e6edf3":"#4b5563"}}>{c.label}</span>
           </div>
-          {ready && (
-            <div style={{ marginTop:20, padding:"14px 18px", background:"#042012", border:"1px solid #166534", borderRadius:8, display:"flex", alignItems:"center", justifyContent:"space-between" }}>
-              <span style={{ color:"#4ade80", fontSize:13 }}>✓ Fichiers chargés — prêt pour l'analyse</span>
-              <button style={btn("#4ade80","#052e16")} onClick={() => setTab("analyse")}>Analyser les écarts →</button>
-            </div>
-          )}
+        ))}
+      </div>
+    </div>
+
+    {revocation.length>0&&(
+      <div style={{background:"#1a0505",border:"1px solid #991b1b",borderRadius:8,padding:"14px 16px",marginBottom:18}}>
+        <div style={{fontSize:10,color:"#f87171",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:10}}>
+          Droits à révoquer — à transmettre à la DSI ({revocation.length})
         </div>
-      );
-
-      /* ── ANALYSE ── */
-      const TabAnalyse = () => {
-        const total = file1?.rows.length ?? 0;
-        const covered = total - ecarts.length;
-        const pct = total > 0 ? Math.round((ecarts.length/total)*100) : 0;
-        const rc = pct>20?"#f85149":pct>5?"#f59e0b":"#3fb950";
-        return (
-          <div>
-            <div style={{ display:"flex", gap:14, marginBottom:24, flexWrap:"wrap" }}>
-              <StatCard label="Droits réels totaux" value={total.toLocaleString("fr-FR")} color="#58a6ff" />
-              <StatCard label="Droits couverts" value={covered.toLocaleString("fr-FR")} color="#3fb950" sub="avec ticket associé" />
-              <StatCard label="Écarts détectés" value={ecarts.length.toLocaleString("fr-FR")} color="#f59e0b" sub="sans justificatif" />
-              <StatCard label="Taux d'écart" value={`${pct}%`} color={rc} sub={pct>20?"⚠ Risque élevé":pct>5?"Attention requise":"Niveau acceptable"} />
+        <div style={{maxHeight:200,overflowY:"auto"}}>
+          {revocation.map((r,i)=>(
+            <div key={i} style={{fontSize:11,fontFamily:"monospace",color:"#e6edf3",marginBottom:4,padding:"4px 8px",background:"#450a0a",borderRadius:3,display:"inline-flex",gap:8,marginRight:6}}>
+              <span style={{color:"#f87171"}}>{r.utilisateur}</span>
+              <span style={{color:"#6e7681"}}>·</span>
+              <span style={{color:"#60a5fa"}}>{r.application}</span>
+              <span style={{color:"#6e7681"}}>·</span>
+              <span>{r.profil||"—"}</span>
             </div>
-            <div style={{ display:"flex", gap:10, marginBottom:14, flexWrap:"wrap" }}>
-              <input value={search} onChange={e=>setSearch(e.target.value)}
-                placeholder="Rechercher utilisateur, application, profil…"
-                style={{...input, flex:"1 1 240px"}} />
-              <select value={filterApp} onChange={e=>setFilterApp(e.target.value)} style={{...input, minWidth:200}}>
-                <option value="all">Toutes les applications ({ecarts.length})</option>
-                {apps.map(a => <option key={a} value={a}>{a} ({ecarts.filter(e=>e.application===a).length})</option>)}
-              </select>
-              {ecarts.length > 0 && <button style={btn("#8b949e")} onClick={exportCSV}>↓ Export CSV</button>}
-            </div>
-            <div style={{ border:"1px solid #30363d", borderRadius:8, overflow:"hidden" }}>
-              <table style={{ width:"100%", borderCollapse:"collapse" }}>
-                <thead>
-                  <tr style={{ background:"#161b22" }}>
-                    {["#","Utilisateur","Application","Profil / Rôle","Statut"].map(h => (
-                      <th key={h} style={{ padding:"10px 14px", textAlign:"left", fontSize:10, fontWeight:600, color:"#8b949e", textTransform:"uppercase", letterSpacing:"0.1em", borderBottom:"1px solid #30363d" }}>{h}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {filtered.length === 0 ? (
-                    <tr><td colSpan={5} style={{ padding:36, textAlign:"center", color:"#8b949e" }}>
-                      {ecarts.length===0?"🎉 Aucun écart détecté":"Aucun résultat pour ce filtre"}
-                    </td></tr>
-                  ) : filtered.map((e,i) => (
-                    <tr key={i} style={{ borderBottom:"1px solid #21262d", background:i%2===0?"transparent":"#0a0e14" }}>
-                      <td style={{ padding:"9px 14px", color:"#4b5563", fontSize:11, fontFamily:"monospace" }}>{i+1}</td>
-                      <td style={{ padding:"9px 14px", fontFamily:"monospace", fontSize:12 }}>{e.utilisateur}</td>
-                      <td style={{ padding:"9px 14px" }}><Badge color="blue">{e.application}</Badge></td>
-                      <td style={{ padding:"9px 14px", fontFamily:"monospace", fontSize:12 }}>{e.profil}</td>
-                      <td style={{ padding:"9px 14px" }}><Badge color="amber">Sans ticket</Badge></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            {filtered.length > 0 && filtered.length < ecarts.length && (
-              <div style={{ textAlign:"right", fontSize:11, color:"#6e7681", marginTop:8 }}>{filtered.length} / {ecarts.length} écarts affichés</div>
-            )}
-            {ecarts.length > 0 && (
-              <div style={{ marginTop:18, display:"flex", justifyContent:"flex-end" }}>
-                <button style={btn("#f59e0b","#1c1407")} onClick={()=>setTab("responsables")}>Configurer les responsables →</button>
-              </div>
-            )}
-          </div>
-        );
-      };
-
-      /* ── RESPONSABLES ── */
-      const TabResponsables = () => (
-        <div>
-          <p style={{ color:"#8b949e", marginBottom:20, lineHeight:1.7, fontSize:13 }}>
-            Renseignez le nom et l'e-mail du responsable à contacter pour chaque application en écart.
-          </p>
-          {apps.length === 0 ? (
-            <div style={{ textAlign:"center", color:"#8b949e", padding:40 }}>Aucun écart détecté</div>
-          ) : (
-            <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
-              {apps.map(app => {
-                const r = responsables[app] || {};
-                const count = ecarts.filter(e=>e.application===app).length;
-                const done = !!(r.nom && r.email);
-                return (
-                  <div key={app} style={{
-                    background:"#161b22", border:`1px solid ${done?"#166534":"#30363d"}`,
-                    borderRadius:8, padding:"14px 18px", display:"flex", alignItems:"center", gap:14, flexWrap:"wrap",
-                  }}>
-                    <div style={{ flex:"0 0 210px" }}>
-                      <div style={{ fontFamily:"monospace", fontWeight:600, color:"#60a5fa", fontSize:13 }}>{app}</div>
-                      <div style={{ marginTop:5 }}><Badge color="amber">{count} écart{count>1?"s":""}</Badge></div>
-                    </div>
-                    <input value={r.nom||""} onChange={e=>updateResp(app,"nom",e.target.value)}
-                      placeholder="Nom du responsable" style={{...input, flex:"1 1 160px"}} />
-                    <input value={r.email||""} onChange={e=>updateResp(app,"email",e.target.value)}
-                      placeholder="email@entreprise.com" type="email" style={{...input, flex:"1 1 200px"}} />
-                    <span style={{ fontSize:18, width:24, textAlign:"center" }}>{done?"✅":"○"}</span>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-          <div style={{ marginTop:20, display:"flex", justifyContent:"flex-end" }}>
-            <button style={btn("#f59e0b","#1c1407")} onClick={()=>setTab("mails")}>Générer les mails →</button>
-          </div>
+          ))}
         </div>
-      );
+      </div>
+    )}
 
-      /* ── MAILS ── */
-      const TabMails = () => (
-        <div>
-          {apps.length === 0 ? (
-            <div style={{ textAlign:"center", color:"#8b949e", padding:40 }}>🎉 Aucun écart — rien à envoyer</div>
-          ) : (
-            <>
-              <p style={{ color:"#8b949e", marginBottom:20, lineHeight:1.7, fontSize:13 }}>
-                Remplacez <strong style={{color:"#f59e0b"}}>[DATE LIMITE]</strong> et votre signature avant envoi.
-              </p>
-              <div style={{ display:"flex", flexDirection:"column", gap:18 }}>
-                {apps.map(app => {
-                  const appEcarts = ecarts.filter(e=>e.application===app);
-                  const resp = responsables[app]||{};
-                  const mailText = makeEmail(app, appEcarts, resp);
-                  const id = `mail_${app}`;
-                  const copied = copiedId===id;
-                  return (
-                    <div key={app} style={{ border:"1px solid #30363d", borderRadius:8, overflow:"hidden" }}>
-                      <div style={{
-                        padding:"12px 18px", background:"#0f131a", borderBottom:"1px solid #30363d",
-                        display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:10,
-                      }}>
-                        <div style={{ display:"flex", alignItems:"center", gap:12 }}>
-                          <span style={{ fontWeight:600, color:"#60a5fa", fontFamily:"monospace" }}>{app}</span>
-                          <Badge color="amber">{appEcarts.length} écart{appEcarts.length>1?"s":""}</Badge>
-                          {resp.email
-                            ? <span style={{ color:"#8b949e", fontSize:12 }}>→ {resp.email}</span>
-                            : <Badge color="gray">Email non renseigné</Badge>
-                          }
-                        </div>
-                        <div style={{ display:"flex", gap:8 }}>
-                          {resp.email && (
-                            <a href={`mailto:${resp.email}?subject=${encodeURIComponent(`[UAR] Revue des accès – ${app}`)}&body=${encodeURIComponent(mailText)}`}
-                               style={{...btn("#8b949e"), textDecoration:"none", display:"inline-block"}}>
-                              ✉ Ouvrir dans Mail
-                            </a>
-                          )}
-                          <button onClick={()=>copy(id,mailText)}
-                            style={btn(copied?"#4ade80":"#f59e0b", copied?"#052e16":"#1c1407")}>
-                            {copied?"✓ Copié !":"⧉ Copier"}
-                          </button>
-                        </div>
-                      </div>
-                      <pre style={{
-                        margin:0, padding:"16px 20px", fontSize:12, lineHeight:1.75,
-                        color:"#c9d1d9", fontFamily:"monospace", whiteSpace:"pre-wrap",
-                        wordBreak:"break-word", maxHeight:340, overflowY:"auto", background:"#0d1117",
-                      }}>
-                        {mailText}
-                      </pre>
-                    </div>
-                  );
-                })}
-              </div>
-            </>
-          )}
-        </div>
-      );
+    <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+      <button style={btn("#8b949e")} onClick={exportSession}>↓ Sauvegarder session</button>
+      <button style={btn("#f59e0b","#1c1407")} onClick={exportBilan}>↓ Exporter bilan JSON</button>
+    </div>
+  </div>
+);
+```
 
-      return (
-        <div style={{ background:"#0d1117", minHeight:"100vh", color:"#e6edf3", fontFamily:"system-ui, sans-serif", fontSize:14 }}>
-          {/* Header */}
-          <div style={{ background:"#161b22", borderBottom:"1px solid #30363d", padding:"14px 24px", display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:10 }}>
-            <div>
-              <div style={{ fontWeight:700, fontSize:16, letterSpacing:"-0.02em" }}>🛡 UAR — Revue des Accès Utilisateurs</div>
-              <div style={{ color:"#6e7681", fontSize:11, marginTop:3 }}>User Access Review · Détection des écarts d'habilitations</div>
-            </div>
-            <div style={{ display:"flex", gap:8 }}>
-              <input ref={sessionRef} type="file" accept=".json" style={{ display:"none" }}
-                onChange={e=>{importSession(e.target.files[0]); e.target.value="";}} />
-              <button style={btn("#8b949e")} onClick={()=>sessionRef.current.click()}>↑ Charger session</button>
-              <button style={btn("#f59e0b","#1c1407")} onClick={exportSession}>↓ Sauvegarder session</button>
-            </div>
-          </div>
+};
 
-          {/* Tabs */}
-          <div style={{ display:"flex", background:"#0d1117", borderBottom:"1px solid #21262d", padding:"0 20px" }}>
-            {TABS.map(t => (
-              <button key={t.id} onClick={()=>!t.off&&setTab(t.id)} style={{
-                padding:"12px 18px", border:"none", background:"transparent",
-                borderBottom:tab===t.id?"2px solid #f59e0b":"2px solid transparent",
-                color:tab===t.id?"#f59e0b":t.off?"#4b5563":"#8b949e",
-                cursor:t.off?"not-allowed":"pointer", fontSize:13, fontWeight:500,
-                display:"flex", alignItems:"center", gap:6, fontFamily:"system-ui, sans-serif",
-              }}>
-                {t.label}
-                {t.dot && <span style={{ width:6, height:6, borderRadius:"50%", background:"#3fb950", display:"inline-block" }} />}
-              </button>
-            ))}
-          </div>
+// ── RENDER ─────────────────────────────────────────────────
+return (
+<div style={{background:”#0d1117”,minHeight:“100vh”,color:”#e6edf3”,fontFamily:“system-ui,sans-serif”,fontSize:14}}>
+<style>{”*{box-sizing:border-box;margin:0;padding:0}select option{background:#161b22}::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-track{background:#0d1117}::-webkit-scrollbar-thumb{background:#30363d;border-radius:3px}”}</style>
 
-          {/* Content */}
-          <div style={{ padding:"28px 24px", maxWidth:1080, margin:"0 auto" }}>
-            {tab==="import"       && <TabImport />}
-            {tab==="analyse"      && <TabAnalyse />}
-            {tab==="responsables" && <TabResponsables />}
-            {tab==="mails"        && <TabMails />}
-          </div>
-        </div>
-      );
-    }
+```
+  <div style={{background:"#161b22",borderBottom:"1px solid #30363d",padding:"12px 22px",display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
+    <div>
+      <div style={{fontWeight:700,fontSize:15,letterSpacing:"-0.02em",display:"flex",alignItems:"center",gap:10}}>
+        🛡 UAR — Revue des Accès Utilisateurs
+        <span style={{fontSize:10,color:"#f59e0b",fontFamily:"monospace",background:"#2d1a00",border:"1px solid #78350f",borderRadius:3,padding:"2px 6px"}}>v2.0</span>
+      </div>
+      <div style={{color:"#6e7681",fontSize:11,marginTop:2}}>Écarts · Orphelins · Dormants · Recertification · Fail-safe · Bilan ISO 27001</div>
+    </div>
+    <div style={{display:"flex",gap:7}}>
+      <input ref={sessionRef} type="file" accept=".json" style={{display:"none"}} onChange={e=>{importSession(e.target.files[0]);e.target.value="";}}/>
+      <button style={btn("#8b949e")} onClick={()=>sessionRef.current.click()}>↑ Charger session</button>
+      <button style={btn("#f59e0b","#1c1407")} onClick={exportSession}>↓ Sauvegarder</button>
+    </div>
+  </div>
 
-    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
-  </script>
+  <div style={{display:"flex",background:"#0d1117",borderBottom:"1px solid #21262d",padding:"0 18px",overflowX:"auto"}}>
+    {TABS.map(t=>(
+      <button key={t.id} onClick={()=>!t.off&&setTab(t.id)} style={{
+        padding:"10px 15px",border:"none",background:"transparent",whiteSpace:"nowrap",
+        borderBottom:tab===t.id?"2px solid #f59e0b":"2px solid transparent",
+        color:tab===t.id?"#f59e0b":t.off?"#374151":"#8b949e",
+        cursor:t.off?"not-allowed":"pointer",fontSize:12,fontWeight:500,
+        display:"flex",alignItems:"center",gap:5,fontFamily:"system-ui,sans-serif",
+      }}>
+        {t.label}
+        {t.dot&&<span style={{width:5,height:5,borderRadius:"50%",background:"#3fb950",display:"inline-block"}}/>}
+      </button>
+    ))}
+  </div>
+
+  <div style={{padding:"22px 22px",maxWidth:1100,margin:"0 auto"}}>
+    {tab==="campagne"     && <TabCampagne/>}
+    {tab==="import"       && <TabImport/>}
+    {tab==="analyse"      && <TabAnalyse/>}
+    {tab==="responsables" && <TabResponsables/>}
+    {tab==="mails"        && <TabMails/>}
+    {tab==="bilan"        && <TabBilan/>}
+  </div>
+</div>
+```
+
+);
+}
+
+ReactDOM.createRoot(document.getElementById(“root”)).render(<App/>);
+</script>
+
 </body>
 </html>
